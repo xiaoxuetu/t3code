@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 
 import * as NodeOS from "node:os";
+import {
+  WORKBENCH_IDENTITY,
+  resolveWorkbenchDevelopmentHome,
+  workbenchDevelopmentEnvironment,
+} from "@t3tools/shared/forkIdentity";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -42,8 +47,6 @@ const FETCH_BAD_PORTS = new Set([
 ]);
 // Dev binds loopback; other interfaces cannot establish port availability.
 const DEV_PORT_PROBE_HOSTS = ["127.0.0.1", "::1"] as const;
-// Migration prunes after copying, so large sources also need an automatic-seeding limit.
-const LARGE_DEV_DATABASE_BYTES = 500 * 1024 * 1024;
 
 /** Only loopback and wildcard binds keep the loopback proxy target reachable. */
 export function isProxiableBindHost(host: string): boolean {
@@ -68,7 +71,7 @@ function sharedBackendTargetHost(host: string | undefined): string {
 }
 
 export const DEFAULT_T3_HOME = Effect.map(Effect.service(Path.Path), (path) =>
-  path.join(NodeOS.homedir(), ".t3"),
+  path.join(NodeOS.homedir(), WORKBENCH_IDENTITY.homeDirectoryName),
 );
 
 const MODE_ARGS = {
@@ -322,18 +325,15 @@ export const createDevRunnerEnv = Effect.fn("dev-runner.createDevRunnerEnv")(fun
   const isDesktopMode = mode === "dev:desktop";
 
   const output: NodeJS.ProcessEnv = {
-    ...baseEnv,
+    ...workbenchDevelopmentEnvironment(
+      baseEnv,
+      configuredBaseDir === undefined ? undefined : resolvedBaseDir,
+    ),
     PORT: String(webPort),
     VITE_DEV_SERVER_URL:
       devUrl?.toString() ??
       `http://${isDesktopMode ? DESKTOP_DEV_LOOPBACK_HOST : "localhost"}:${webPort}`,
   };
-
-  if (configuredBaseDir !== undefined) {
-    output.T3CODE_HOME = resolvedBaseDir;
-  } else {
-    delete output.T3CODE_HOME;
-  }
 
   // Managed T3 service shells leak launcher variables that make dev servers fail version checks.
   // Dev-runner servers are never launcher-managed (serviceLauncherClient.ts resolveStartup).
@@ -613,59 +613,14 @@ const runRepoScript = Effect.fn("dev-runner.runRepoScript")(function* (
   }
 });
 
-/**
- * The first start in a worktree seeds its empty database from a small live database
- * and warms the web dependency cache. Each step checks for its own output, so
- * later starts skip it.
- */
+/** Warm only the fork's dependency cache; never import an existing database. */
 const prepareFirstStart = Effect.fn("dev-runner.prepareFirstStart")(function* (input: {
   readonly mode: DevMode;
-  readonly seed: boolean;
-  readonly worktreeHome: string | undefined;
   readonly env: NodeJS.ProcessEnv;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const exists = (file: string) => fs.exists(file).pipe(Effect.orElseSucceed(() => false));
-
-  if (input.worktreeHome !== undefined && input.mode !== "dev:web") {
-    const stateDir = path.join(input.worktreeHome, "userdata");
-    for (const name of ["statev2.sqlite", "state.sqlite"]) {
-      const file = path.join(stateDir, name);
-      const info = yield* fs.stat(file).pipe(Effect.option);
-      if (Option.isSome(info) && Number(info.value.size) > LARGE_DEV_DATABASE_BYTES) {
-        yield* Effect.logWarning(
-          `[dev-runner] ${file} is ${Math.round(Number(info.value.size) / 1024 / 1024)} MB. With the dev server stopped, \`vp run migrate-dev-db\` rebuilds statev2.sqlite as a small copy of recent data.`,
-        );
-      }
-    }
-    const source = path.join(yield* HostProcess.HomeDirectory, ".t3", "userdata", "statev2.sqlite");
-    // A V1 state.sqlite counts as data too: the server imports it only while
-    // statev2.sqlite is missing, so seeding would hide it.
-    if (
-      input.seed &&
-      !(yield* exists(path.join(stateDir, "statev2.sqlite"))) &&
-      !(yield* exists(path.join(stateDir, "state.sqlite")))
-    ) {
-      const info = yield* fs.stat(source).pipe(Effect.option);
-      if (Option.isSome(info)) {
-        if (Number(info.value.size) > LARGE_DEV_DATABASE_BYTES) {
-          yield* Effect.logWarning(
-            `[dev-runner] ${source} exceeds 500 MiB; skipping automatic database seeding and starting with an empty database. Run \`vp run migrate-dev-db\` manually with dev stopped if needed; it may use substantial disk space before pruning.`,
-          );
-        } else {
-          yield* Effect.logInfo(
-            `[dev-runner] seeding ${input.worktreeHome} from ${source} (read-only). --no-seed or T3CODE_DEV_SEED=0 skips this.`,
-          );
-          yield* runRepoScript(
-            "apps/server/scripts/migrate-dev-db.ts",
-            ["--base-dir", input.worktreeHome, "--source", source],
-            input.env,
-          );
-        }
-      }
-    }
-  }
 
   const repoRoot = path.dirname(import.meta.dirname);
   if (
@@ -735,17 +690,16 @@ export const runDevRunnerWithInput = Effect.fn("dev-runner.runDevRunnerWithInput
   });
 
   const hostEnvironment = yield* HostProcess.Environment;
-  // A dev server started inside a worktree defaults to that worktree's own
-  // (gitignored) `.t3` — see @t3tools/shared/devHome for why this must
-  // outrank an ambient T3CODE_HOME. `--home-dir` still wins.
+  // Worktrees use their own fork-specific state; an explicit --home-dir still wins.
   const worktreeHome = yield* resolveWorktreeT3Home(yield* HostProcess.WorkingDirectory);
   // Trim before choosing: `--home-dir ""` is not a selection, and treating it
   // as one would skip the worktree default and land on the shared home —
   // exactly the outcome this precedence exists to prevent.
-  const resolvedT3Home =
-    (input.t3Home?.trim() || undefined) ??
-    worktreeHome ??
-    (hostEnvironment.T3CODE_HOME?.trim() || undefined);
+  const resolvedT3Home = resolveWorkbenchDevelopmentHome(
+    input.t3Home,
+    worktreeHome,
+    hostEnvironment,
+  );
   const env = yield* createDevRunnerEnv({
     mode: input.mode,
     baseEnv: hostEnvironment,
@@ -764,7 +718,7 @@ export const runDevRunnerWithInput = Effect.fn("dev-runner.runDevRunnerWithInput
     serverOffset !== offset || webOffset !== offset
       ? ` selectedOffset(server=${serverOffset},web=${webOffset})`
       : "";
-  const baseDir = env.T3CODE_HOME ?? (yield* DEFAULT_T3_HOME);
+  const baseDir = env[WORKBENCH_IDENTITY.homeEnvironmentVariable] ?? (yield* DEFAULT_T3_HOME);
 
   yield* Effect.logInfo(
     `[dev-runner] mode=${input.mode} source=${source}${selectionSuffix} serverPort=${String(env.T3CODE_PORT)} webPort=${String(env.PORT)} baseDir=${baseDir}`,
@@ -862,11 +816,12 @@ export const runDevRunnerWithInput = Effect.fn("dev-runner.runDevRunnerWithInput
     }
   }
 
+  if (input.seed === true) {
+    yield* Effect.logWarning("[dev-runner] Database seeding is disabled in T3 Pstack Workbench.");
+  }
   // After sharing, so the warm step sees the same bundled-dev env as Vite.
   yield* prepareFirstStart({
     mode: input.mode,
-    seed: input.seed !== false,
-    worktreeHome: baseDir === worktreeHome ? worktreeHome : undefined,
     env,
   });
 
@@ -931,7 +886,7 @@ const devRunnerCli = Command.make("dev-runner", {
   ),
   t3Home: Flag.String("home-dir").pipe(
     Flag.withDescription(
-      "Explicit T3 Code data directory; runtime state is stored under userdata (equivalent to T3CODE_HOME). Inside a git worktree this defaults to that worktree's own .t3 so dev state stays off the shared home.",
+      "Explicit Workbench data directory; runtime state is stored under userdata (equivalent to T3_PSTACK_WORKBENCH_HOME). Worktrees default to their own .t3-pstack-workbench directory.",
     ),
     Flag.optional,
     Flag.map(Option.getOrUndefined),
@@ -986,9 +941,9 @@ const devRunnerCli = Command.make("dev-runner", {
   ),
   seed: Flag.Boolean("seed").pipe(
     Flag.withDescription(
-      "Seed an empty worktree database from ~/.t3 on first start (read-only, via migrate-dev-db) if the source is at most 500 MiB. On by default; --no-seed or T3CODE_DEV_SEED=0 skips it.",
+      "Database seeding is disabled in Workbench; this compatibility flag never imports existing data.",
     ),
-    Flag.withFallbackConfig(optionalBooleanConfig("T3CODE_DEV_SEED")),
+    Flag.withFallbackConfig(optionalBooleanConfig("T3_PSTACK_WORKBENCH_DEV_SEED")),
   ),
   built: Flag.Boolean("built").pipe(
     Flag.withDescription(

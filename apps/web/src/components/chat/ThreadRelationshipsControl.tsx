@@ -3,6 +3,8 @@ import { threadKey } from "@t3tools/client-runtime/state/entities";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
+import { TeamTaskBoard } from "./TeamTaskBoard";
+import { visibleDelegatedTeamTasks } from "./TeamTaskBoard.logic";
 import { SectionHeaderStatus } from "../ui/collapsible-section-header";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
@@ -621,10 +623,15 @@ export function ThreadRelationshipsPanel(props: {
       delegatedFrom !== undefined ||
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
       (canDetach && sideChats.length > 0));
+  const teamTasks = props.showLineage
+    ? visibleDelegatedTeamTasks(projected, props.environmentId, (target) =>
+        hiddenKeys.has(threadKey(target)),
+      )
+    : [];
   const sideChatsVisible = props.showSideChats && sideChats.length > 0;
   const runningSideChats = sideChats.filter(({ edge }) => edge.status === "running").length;
 
-  if (!lineageVisible && !sideChatsVisible) {
+  if (!lineageVisible && !sideChatsVisible && teamTasks.length === 0) {
     return null;
   }
 
@@ -969,6 +976,12 @@ export function ThreadRelationshipsPanel(props: {
 
   return (
     <>
+      <TeamTaskBoard
+        key={scopedThreadKey(ref)}
+        tasks={teamTasks}
+        environmentId={props.environmentId}
+        providers={providersByEnvironment}
+      />
       {lineageVisible ? (
         <ThreadDetailsSection
           headingId="thread-details-lineage-heading"

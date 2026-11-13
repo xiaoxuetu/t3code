@@ -15,6 +15,20 @@ const validPreload = `
 `;
 
 describe("desktop preload bundle verifier", () => {
+  it.each(["desktop:take-legacy-local-storage", "desktop:complete-legacy-local-storage"])(
+    "rejects a swallowed legacy migration call to %s",
+    (channel) => {
+      assert.throws(
+        () => verifyPreloadBundle(`${validPreload}
+          try {
+            electron.ipcRenderer.sendSync(${JSON.stringify(channel)});
+          } catch {}
+        `),
+        /must not request legacy storage migration/,
+      );
+    },
+  );
+
   it("rejects required API names that only appear in strings", () => {
     assert.throws(
       () =>

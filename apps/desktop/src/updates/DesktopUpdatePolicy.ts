@@ -1,3 +1,4 @@
+import { WORKBENCH_UPDATE_DISABLED_REASON } from "@t3tools/shared/forkIdentity";
 /**
  * DesktopUpdatePolicy - what the administrator's managed policy allows the desktop updater to do.
  * The desktop reads the policy file itself, before any backend runs, and fails closed: a policy it
@@ -65,7 +66,13 @@ const make = Effect.gen(function* () {
             allowNightly: policy.allowNightly,
           }),
     ),
-    Effect.map(({ policy }) => policy),
+    Effect.map(({ policy }): UpdatePolicy => ({
+      ...policy,
+      mode: "off",
+      feedUrl: undefined,
+      allowNightly: false,
+      message: WORKBENCH_UPDATE_DISABLED_REASON,
+    })),
     Effect.catchTags({
       ManagedPolicyFileError: (error) =>
         logError("updates are off because the managed policy cannot be used", {

@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/cursor/plugins",
+  "commit": "6e359ce0aba9e927914d8a940510aa2ef66a8f23",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 Lauren Tan",
+  "files": [
+    {
+      "upstreamPath": "pstack/LICENSE",
+      "localPath": "upstream/LICENSE",
+      "sha256": "bc957ca6bee02792566a1a028d105e02e247c6e77cf057061674273da77b200e",
+      "url": "https://raw.githubusercontent.com/cursor/plugins/6e359ce0aba9e927914d8a940510aa2ef66a8f23/pstack/LICENSE"
+    },
+    {
+      "upstreamPath": "pstack/skills/swarm/SKILL.md",
+      "localPath": "upstream/skills/swarm/SKILL.md",
+      "sha256": "fea6bfbbf21e067a4e2d2ebab034bc3af508118e9df1abc9d2ba040d58a6df3a",
+      "url": "https://raw.githubusercontent.com/cursor/plugins/6e359ce0aba9e927914d8a940510aa2ef66a8f23/pstack/skills/swarm/SKILL.md"
+    },
+    {
+      "upstreamPath": "pstack/skills/poteto-mode/playbooks/orchestrate.md",
+      "localPath": "upstream/skills/poteto-mode/playbooks/orchestrate.md",
+      "sha256": "dfd7e53e7ef844ae11394672b2f8e22ced47b977ff6e947fef837953cc95bb86",
+      "url": "https://raw.githubusercontent.com/cursor/plugins/6e359ce0aba9e927914d8a940510aa2ef66a8f23/pstack/skills/poteto-mode/playbooks/orchestrate.md"
+    }
+  ]
+}

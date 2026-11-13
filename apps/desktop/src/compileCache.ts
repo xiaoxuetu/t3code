@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import { WORKBENCH_IDENTITY } from "@t3tools/shared/forkIdentity";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -13,7 +14,7 @@ try {
       process.platform === "linux"
         ? process.env.XDG_CACHE_HOME || NodePath.join(NodeOS.homedir(), ".cache")
         : NodeOS.tmpdir();
-    const directory = NodePath.join(cacheRoot, "t3code", "compile-cache");
+    const directory = NodePath.join(cacheRoot, WORKBENCH_IDENTITY.executableName, "compile-cache");
     const prepared =
       process.env.ELECTRON_RUN_AS_NODE === "1" &&
       enablePreparedServerCache(process.argv[1] ?? "", directory);

@@ -1,0 +1,61 @@
+# Workbench validation builds
+
+This fork uses T3 as its only session runtime and pstack as an opt-in coordination convention. The first slice adds a current-conversation task panel, not a project-wide scheduler or a second agent runtime. The source changes are an engineering preview. No desktop package or real provider session has been validated in the initial workspace.
+
+## Source and licenses
+
+The T3 base is `5f85768394f417f5bd098ca7fe4fc41ef07a7cda` from `pingdotgg/t3code`, MIT, Copyright (c) 2026 T3 Tools Inc. The selected pstack references are pinned in [`integrations/pstack/UPSTREAM.json`](../../integrations/pstack/UPSTREAM.json), MIT, Copyright (c) 2026 Lauren Tan. Preserve both notices. Qoder's proprietary CLI is not included.
+
+## macOS Apple Silicon first
+
+The first downloadable target is macOS arm64. Windows, Linux, Intel Mac, and mobile delivery are deferred and do not gate this preview. Codex, Antigravity, and Qoder remain executor requirements; delaying other operating systems does not mark these providers complete or remove them from acceptance.
+
+The manual [macOS preview workflow](../../.github/workflows/workbench-macos.yml) uses the public fork and a native `macos-26` arm64 runner. It downloads the locked toolchain and dependencies, builds DMG/ZIP, checks the mounted app's identifier, architecture, pstack resources and code-signature integrity, then launches it against the repository's synthetic fixture database. It uploads artifacts only after startup succeeds. It does not publish a Release or use Apple signing credentials. GitHub currently documents `macos-26` as arm64; the job also checks the actual host architecture. See [runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+The workflow is prepared but has not run. Its dependency/app-execution checkbox defaults to false. This Linux workspace cannot validate macOS native tools or mount a DMG. The fixture smoke verifies startup and a readable conversation, not agent execution, task delegation or model authentication. The smoke uses the fork's isolated state; macOS Electron profile stays under the disposable runner's real home so it can use the runner's keychain.
+
+Signing status comes from the actual `codesign` report. Without separately configured Developer ID signing and notarization, do not promise Gatekeeper-trusted distribution or equate a CI launch with a successful downloaded installation. Do not disable Gatekeeper or remove quarantine as part of this pipeline. Read the produced app's minimum OS value rather than inferring it from the build runner. Electron-builder's [v26 macOS documentation](https://www.electron.build/v26/docs/mac/) describes the architecture and signing options.
+
+The first engineering preview can ship after native build, signature-integrity and fixture-startup checks, with its unverified items clearly labeled. The first usable team preview additionally needs one real coordinator and two delegated worker conversations on a disposable project, visible results, and task-to-session navigation. These workers may use one already available executor; completing all three providers is not a prerequisite for the first package. Test downloaded installation through the normal macOS flow on an Apple Silicon Mac and verify independent application/state paths before calling installation verified. Record Codex, AGY, and Qoder outcomes separately; their remaining work continues after the first preview. The persisted editable task planner, saved roles, other platforms and full scheduling/recovery acceptance remain follow-up work. See the [minimal Mac validation guide](../user/macos-preview.md).
+
+## Build without publishing
+
+The Linux cloud workspace now has a separate verified Node 26.12.1, pnpm 12.14.0 and Vite+ 1.4.0 toolchain and a successful filtered frozen dependency install. Dependency lifecycle scripts were disabled in this preparation. Focused package typechecks and existing tests run against these real dependencies; native desktop builds, Electron launch, model turns and paid evals remain separate checks. The cloud platform cannot run the Vite+ task supervisor because seccomp_unotify is unavailable, so package typechecks used the same locked effect-tsgo binary directly; no outer sandbox restriction was disabled. The user's development, packaging and cloud-install validation request covers ordinary necessary build steps whose sources have been verified. Review any unknown installer before execution and obtain the action-time confirmation required for unknown sources; do not turn every locked build dependency into a repeated permission request. Build and installation validation use our isolated cloud environment or a disposable runner, not the user's Mac.
+
+The optional [Workbench Linux validation build](../../.github/workflows/workbench-linux.yml) is independent of the upstream release workflow and uses a standard disposable GitHub runner. The coordinator can run it after the repository and dependency execution are authorized. Its checkbox describes the downloads and scripts it will execute; it defaults to disabled. It uses read-only repository permissions, uploads a validation artifact, and does not create a Release, push, sign, notarize, or publish. The workflow itself has not run and can expose additional upstream build constraints.
+
+On a prepared, approved Apple Silicon Mac, the first-target build commands are:
+
+```sh
+node --test scripts/verify-team-tasks.test.mjs
+node --experimental-vm-modules --test apps/desktop/scripts/verify-workbench-isolation.mjs
+node integrations/pstack/verify-upstream.mjs
+vp exec --filter @t3tools/web -- effect-tsgo tsrs --noEmit
+vp exec --filter @t3tools/desktop -- effect-tsgo tsrs --noEmit
+vp exec --filter t3 -- effect-tsgo tsrs --noEmit
+vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version 0.1.0-workbench.3 --output-dir release-workbench-macos --verbose
+```
+
+The isolated Node boundary checks use authored Effect service stubs; they do not verify the real Effect runtime or Electron. The existing artifact builder performs staged production dependency installation and native compilation. It passes `--publish never` to electron-builder. Do not interpret a successful JS bundle as a successful desktop package or runtime smoke test. The macOS preview has its own native workflow; other platform packaging does not gate it. Do not run the upstream release workflow for this fork.
+
+## Isolation to verify in the package
+
+The fork's identity is centralized in [`forkIdentity.ts`](../../packages/shared/src/forkIdentity.ts). Default changes separate the product name, application ID, executable name, home directory, desktop profile, and URL schemes from the official app. Legacy profile readers and migration merge code are removed; the compatibility lifecycle always returns no data and performs no I/O. Official automatic updates are disabled. CLI/PATH installation is disabled for this preview. These source defaults still need a packaged runtime test on every target platform; explicit paths and external provider account stores are not isolated by a product rename.
+
+Preload performs no legacy-storage IPC or merge. Compatibility IPC does not flush Chromium storage or write migration markers. There is no flag that can re-enable the removed reader.
+
+Development startup now uses the fork HOME variable and worktree directory, discards inherited `T3CODE_HOME`, and never seeds a database from the official app. `--seed` is only a compatibility flag and cannot import history. The public `migrate-dev-db` command is disabled before filesystem or database access. Desktop compile cache uses the fork namespace. These changes were applied only after the user explicitly approved the separate state and loss of automatic history import.
+
+For an approved runtime check, set `T3_PSTACK_WORKBENCH_HOME` to a new empty directory and use an isolated dummy project with the free Replay provider first. Verify that the official app can remain open, its state is untouched, the fork writes only to its own state and cache directories, the custom URL scheme opens the fork, and update actions cannot fetch official installers. Also check that the fork does not install or replace a `t3` CLI entry. The original `T3CODE_HOME` must not select the fork's data directory.
+
+The source guards are covered by Node boundary checks using authored service stubs. Full Effect/Electron behavior, native capture integrations, SSH/service deployment, shared system managed-policy paths, and external provider account stores are not isolated by these checks. Do not advertise complete isolation before the corresponding packaged tests.
+
+The pstack text resources should be included under the installed app's `resources/pstack` directory. To use the workflow with another project, copy those text references to that project's `integrations/pstack` directory, or explicitly give the coordinator their readable absolute path. No SessionStart hook or plugin trust is approved by this build.
+
+## Acceptance before a download Release
+
+Exercise goal confirmation, an approved two-task delegation, visible owner and progress, waiting/approval handling, task-to-session navigation, independent review, cancellation, and schedule pause/resume. The current task panel shows only loaded app-owned delegation attempts. It does not store plan rows or acceptance verdicts; it keeps completed task results separate from later session turns.
+
+Codex and Antigravity have upstream implementations, but both require real end-to-end validation here. Qoder can be investigated through T3's existing local ACP command or Registry entry after the user installs and authenticates it. The documented command is `qoder --acp`; validate the actual installed executable and advertised tools rather than guessing. Test MCP injection, delegated session creation, approvals, cancellation, reconnect, and result delivery before advertising support. Do not pass a bypass-permissions option as an integration workaround.
+
+Model compliance, scheduled reports, history pagination, mobile UI, remote connection modes, and recovery across restarts remain separate acceptance items. The workflow's artifact and remaining integration paths must be smoke-tested before the coordinator creates a downloadable desktop Release. Attach checksums, exact source commit, the test results actually observed, and the remaining limitations. A source-only Release must be labeled source-only.

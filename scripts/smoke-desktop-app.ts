@@ -2,6 +2,7 @@
 // Launches a packaged desktop app against a seeded T3 home, opens a thread, and checks its
 // messages render. Release jobs run it so a build whose backend or bundle cannot start fails
 // before it is published.
+import { workbenchDevelopmentEnvironment } from "@t3tools/shared/forkIdentity";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -42,14 +43,16 @@ try {
   app = await _electron.launch({
     executablePath: executable,
     // Linux CI runners do not allow the Chromium sandbox's user namespaces.
-    args: [...(values.app ? [NodePath.resolve(values.app)] : []), "--no-sandbox"],
+    args: [
+      ...(values.app ? [NodePath.resolve(values.app)] : []),
+      ...(process.platform === "linux" ? ["--no-sandbox"] : []),
+    ],
     // HOME stays real: on macOS a fake HOME has no login keychain, and safeStorage blocks the
     // main process on a keychain dialog. macOS keeps its Electron profile in the runner's HOME.
     env: {
-      ...process.env,
+      ...workbenchDevelopmentEnvironment(process.env, t3Home),
       XDG_CONFIG_HOME: NodePath.join(home, ".config"),
       XDG_DATA_HOME: NodePath.join(home, ".local/share"),
-      T3CODE_HOME: t3Home,
       T3CODE_TELEMETRY_ENABLED: "false",
       T3CODE_DISABLE_AUTO_UPDATE: "true",
     },

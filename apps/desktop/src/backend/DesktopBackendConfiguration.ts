@@ -1,3 +1,4 @@
+import { WORKBENCH_IDENTITY } from "@t3tools/shared/forkIdentity";
 import * as NodeOS from "node:os";
 
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
@@ -648,7 +649,7 @@ const resolveWslStartConfig = Effect.fn("desktop.backendConfiguration.resolveWsl
 
   const parentEnvWithoutT3Home: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(env)) {
-    if (key === "T3CODE_HOME") continue;
+    if (key === "T3CODE_HOME" || key === WORKBENCH_IDENTITY.homeEnvironmentVariable) continue;
     parentEnvWithoutT3Home[key] = value;
   }
   const wslEnv = mergeWslEnv(parentEnvWithoutT3Home.WSLENV, forwardedEnvNames);
@@ -788,7 +789,9 @@ export const make = Effect.gen(function* () {
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
     );
-    const cliPath = yield* DesktopCliShim.install.pipe(
+    const cliPath = yield* (WORKBENCH_IDENTITY.desktopCliInstallationEnabled
+      ? DesktopCliShim.install
+      : Effect.succeed(Option.none<string>())).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
     );

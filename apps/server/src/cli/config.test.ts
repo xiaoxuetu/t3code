@@ -421,7 +421,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
                 env: {
                   T3CODE_MODE: "web",
                   T3CODE_BOOTSTRAP_FD: String(fd),
-                  T3CODE_HOME: baseDir,
+                  T3_PSTACK_WORKBENCH_HOME: baseDir,
                   T3CODE_NO_BROWSER: "true",
                   T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD: "true",
                   T3CODE_LOG_WS_EVENTS: "true",

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.t3pstack.workbench</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>T3 Pstack Workbench</name>
+  <summary>Desktop GUI for coding agents</summary>
+  <developer id="org.t3pstack">
+    <name>T3 Pstack Workbench contributors</name>
+  </developer>
+  <description>
+    <p>
+      T3 Pstack Workbench is an open-source desktop app for coding agents. Work with your
+      existing agent subscriptions, review code changes, and run commands in
+      your projects.
+    </p>
+    <p>
+      Connect from desktop, web, or mobile to continue working remotely.
+    </p>
+  </description>
+  <launchable type="desktop-id">t3-pstack-workbench.desktop</launchable>
+  <icon type="stock">t3-pstack-workbench</icon>
+  <provides>
+    <binary>t3-pstack-workbench</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+  </categories>
+</component>

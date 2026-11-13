@@ -1,3 +1,4 @@
+import { WORKBENCH_IDENTITY } from "@t3tools/shared/forkIdentity";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- FileSystem.access has no execute check.
 import * as NodeFSP from "node:fs/promises";
 
@@ -465,4 +466,27 @@ export const make = Effect.gen(function* () {
   return DesktopCliCommand.of({ state, install, uninstall, addToPath, installOnFirstLaunch });
 });
 
-export const layer = Layer.effect(DesktopCliCommand, make);
+const unsupportedCommand = Effect.fail(
+  new DesktopCliCommandError({ message: "CLI installation is not supported by T3 Pstack Workbench." }),
+);
+const unsupportedState: DesktopCliCommandState = {
+  supported: false,
+  installedPath: null,
+  onPath: false,
+  launcherPath: null,
+};
+
+export const layer = Layer.effect(
+  DesktopCliCommand,
+  WORKBENCH_IDENTITY.desktopCliInstallationEnabled
+    ? make
+    : Effect.succeed(
+        DesktopCliCommand.of({
+          state: Effect.succeed(unsupportedState),
+          install: unsupportedCommand,
+          uninstall: unsupportedCommand,
+          addToPath: unsupportedCommand,
+          installOnFirstLaunch: Effect.void,
+        }),
+      ),
+);

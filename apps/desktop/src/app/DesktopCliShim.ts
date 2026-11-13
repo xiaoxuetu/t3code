@@ -1,3 +1,4 @@
+import { WORKBENCH_IDENTITY } from "@t3tools/shared/forkIdentity";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -51,7 +52,7 @@ export const renderCliShim = (input: {
           ]
         : []),
       `set "T3CODE_CLI_PATH=${cmdText(input.shimPath)}"`,
-      `if not defined T3CODE_HOME set "T3CODE_HOME=${cmdText(input.t3Home)}"`,
+      `if not defined ${WORKBENCH_IDENTITY.homeEnvironmentVariable} set "${WORKBENCH_IDENTITY.homeEnvironmentVariable}=${cmdText(input.t3Home)}"`,
       'set "ELECTRON_RUN_AS_NODE=1"',
       // Electron's Windows executable starts without stdin; this tells the CLI to reopen the console.
       'set "T3CODE_DESKTOP_CLI_LAUNCHER=1"',
@@ -73,7 +74,7 @@ export const renderCliShim = (input: {
     `# ${MARKER}`,
     `export T3CODE_CLI_PATH=${shellWord(input.shimPath)}`,
     `home=${shellWord(input.t3Home)}`,
-    'export T3CODE_HOME="${T3CODE_HOME:-$home}"',
+    `export ${WORKBENCH_IDENTITY.homeEnvironmentVariable}="\${${WORKBENCH_IDENTITY.homeEnvironmentVariable}:-$home}"`,
     "export ELECTRON_RUN_AS_NODE=1",
     `app=${shellWord(target.kind === "appimage" ? target.appImage : target.executable)}`,
     'if [ ! -x "$app" ]; then',

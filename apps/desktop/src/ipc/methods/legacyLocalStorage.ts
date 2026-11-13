@@ -1,4 +1,3 @@
-import * as Electron from "electron";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -20,10 +19,9 @@ export const completeLegacyLocalStorage = makeIpcMethod({
   channel: IpcChannels.COMPLETE_LEGACY_LOCAL_STORAGE_CHANNEL,
   payload: Schema.Void,
   result: Schema.Void,
-  handler: Effect.fn("desktop.ipc.legacyLocalStorage.complete")(function* (_, event) {
+  handler: Effect.fn("desktop.ipc.legacyLocalStorage.complete")(function* () {
     const legacy = yield* DesktopLegacyLocalStorage.DesktopLegacyLocalStorage;
-    // Flush Chromium's lazy writes before the marker prevents migration retries.
-    if (event) Electron.webContents.fromId(event.sender.id)?.session.flushStorageData();
+    // Compatibility channel only; no Chromium storage flush or migration marker.
     yield* legacy.complete;
   }),
 });

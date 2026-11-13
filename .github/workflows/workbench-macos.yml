@@ -1,0 +1,152 @@
+name: Workbench macOS Apple Silicon preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_dependency_execution:
+        description: "Allow toolchain/dependency downloads, native builds and app launch on this disposable Mac"
+        type: boolean
+        required: true
+        default: false
+      version:
+        description: "Version for this macOS engineering preview"
+        type: string
+        required: true
+        default: "0.1.0-workbench.3"
+
+permissions:
+  contents: read
+
+jobs:
+  mac_arm64:
+    if: inputs.allow_dependency_execution
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      BUILD_VERSION: ${{ inputs.version }}
+      APP_VERSION: ${{ inputs.version }}
+      T3_PSTACK_WORKBENCH_HOME: ${{ runner.temp }}/workbench-state
+      T3_PSTACK_WORKBENCH_DEV_SEED: "0"
+      T3CODE_DESKTOP_SIGNED: "false"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Checkout public fork without persisted credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git -c credential.helper= remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c credential.helper= fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
+      - name: Verify native runner and version
+        shell: bash
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          node --input-type=module -e 'if (!/^\d+\.\d+\.\d+-workbench\.\d+$/.test(process.env.BUILD_VERSION ?? "")) throw new Error("Use a version such as 0.1.0-workbench.3")'
+          sw_vers
+          xcrun --find clang
+          xcrun --find iconutil
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - name: Setup locked workspace toolchain and dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Verify task logic, isolation boundaries and pstack provenance
+        shell: bash
+        run: |
+          node --test scripts/verify-team-tasks.test.mjs
+          node --experimental-vm-modules --test apps/desktop/scripts/verify-workbench-isolation.mjs
+          node integrations/pstack/verify-upstream.mjs
+      - name: Typecheck affected applications
+        shell: bash
+        run: |
+          vp exec --filter @t3tools/web -- effect-tsgo tsrs --noEmit
+          vp exec --filter @t3tools/desktop -- effect-tsgo tsrs --noEmit
+          vp exec --filter t3 -- effect-tsgo tsrs --noEmit
+          vp exec --filter @t3tools/scripts -- effect-tsgo tsrs --noEmit
+      - name: Run focused shared regression tests
+        working-directory: packages/shared
+        shell: bash
+        run: vp test run --config ../../vite.config.ts --dir . src/devHome.test.ts src/providerAuthReturnUrl.test.ts src/remote.test.ts src/promptLinks.test.ts
+      - name: Run focused build and development regression tests
+        working-directory: scripts
+        shell: bash
+        run: vp test run --config ../vite.config.ts --dir . dev-runner.test.ts build-desktop-artifact.test.ts
+      - name: Verify desktop profile compatibility and preload boundaries
+        working-directory: apps/desktop
+        shell: bash
+        run: vp test run --project unit src/app/DesktopLegacyLocalStorage.test.ts src/app/DesktopUserData.test.ts src/app/DesktopEnvironment.test.ts src/app/DesktopApp.test.ts scripts/verify-preload-bundle.test.mjs
+      - name: Build macOS arm64 DMG and ZIP
+        shell: bash
+        run: |
+          node scripts/update-release-package-versions.ts "$BUILD_VERSION"
+          vp run --filter @t3tools/desktop --filter t3 --concurrency-limit 1 build
+          vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version "$BUILD_VERSION" --output-dir release-workbench-macos --skip-build --verbose
+      - name: Mount and validate packaged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p macos-validation
+          dmg=$(node --input-type=module -e 'import fs from "node:fs"; const names=fs.readdirSync("release-workbench-macos").filter(n=>n.endsWith("-arm64.dmg")); if(names.length!==1) throw new Error("Expected exactly one arm64 DMG"); process.stdout.write(`release-workbench-macos/${names[0]}`)')
+          mount="$RUNNER_TEMP/workbench-dmg"
+          mkdir -p "$mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          export WORKBENCH_MOUNT="$mount"
+          app=$(node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; const names=fs.readdirSync(process.env.WORKBENCH_MOUNT).filter(n=>n.endsWith(".app")); if(names.length!==1) throw new Error("Expected exactly one app"); process.stdout.write(path.join(process.env.WORKBENCH_MOUNT,names[0]))')
+          identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+          test "$identifier" = org.t3pstack.workbench
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          binary="$app/Contents/MacOS/$executable"
+          test "$(lipo -archs "$binary")" = arm64
+          test -f "$app/Contents/Resources/pstack/t3-team.md"
+          test -f "$app/Contents/Resources/pstack/upstream/LICENSE"
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist" > macos-validation/minimum-system-version.txt
+          codesign --verify --deep --strict --verbose=2 "$app" > macos-validation/codesign-verify.txt 2>&1
+          codesign -dv --verbose=4 "$app" > macos-validation/codesign-details.txt 2>&1
+          node scripts/smoke-desktop-app.ts --executable "$binary" --artifacts-dir macos-validation/launch
+          printf '%s\n' 'Packaged startup and fixture thread passed. Download Gatekeeper behavior and real provider workflows remain unverified.' > macos-validation/STATUS.txt
+      - name: Record checksums and preview scope
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { readdir, readFile, writeFile } from "node:fs/promises";
+          import { createHash } from "node:crypto";
+          const names=(await readdir("release-workbench-macos")).filter(name=>name.endsWith(".dmg")||name.endsWith(".zip")).sort();
+          if(names.length!==2) throw new Error("Expected DMG and ZIP");
+          const rows=await Promise.all(names.map(async name=>`${createHash("sha256").update(await readFile(`release-workbench-macos/${name}`)).digest("hex")}  ${name}`));
+          await writeFile("release-workbench-macos/SHA256SUMS",`${rows.join("\n")}\n`);
+          await writeFile("release-workbench-macos/VALIDATION.json",JSON.stringify({sourceCommit:process.env.GITHUB_SHA,platform:"darwin",arch:"arm64",packagedStartup:"passed",fixtureThread:"passed",downloadGatekeeper:"not verified",notarization:"not configured",realProviders:{codex:"not verified",antigravity:"not verified",qoder:"not verified"},teamWorkflow:"not verified",otherPlatforms:"deferred"},null,2)+"\n");
+          JS
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workbench-macos-arm64-validation
+          path: macos-validation/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload macOS engineering preview
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t3-pstack-workbench-macos-arm64
+          path: |
+            release-workbench-macos/*.dmg
+            release-workbench-macos/*.zip
+            release-workbench-macos/SHA256SUMS
+            release-workbench-macos/VALIDATION.json
+            LICENSE
+            integrations/pstack/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

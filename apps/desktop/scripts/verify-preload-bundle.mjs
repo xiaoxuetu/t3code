@@ -57,12 +57,18 @@ const inspectBundle = (source) => {
   return runtimeImports;
 };
 
-const createSandboxModules = (exposedGlobals) => {
+const createSandboxModules = (exposedGlobals, ipcCalls) => {
   const ipcRenderer = {
-    invoke: () => Promise.resolve(undefined),
+    invoke: (channel) => {
+      ipcCalls.add(channel);
+      return Promise.resolve(undefined);
+    },
     on: () => undefined,
     removeListener: () => undefined,
-    sendSync: () => undefined,
+    sendSync: (channel) => {
+      ipcCalls.add(channel);
+      return undefined;
+    },
   };
   const electron = {
     contextBridge: {
@@ -125,7 +131,8 @@ const executeBundle = (source, sandboxModules) => {
 export const verifyPreloadBundle = (source) => {
   const runtimeImports = inspectBundle(source);
   const exposedGlobals = new Map();
-  const sandboxModules = createSandboxModules(exposedGlobals);
+  const ipcCalls = new Set();
+  const sandboxModules = createSandboxModules(exposedGlobals, ipcCalls);
   const unsupportedImports = [...new Set(runtimeImports)]
     .filter((moduleName) => !sandboxModules.has(moduleName))
     .toSorted();
@@ -137,6 +144,11 @@ export const verifyPreloadBundle = (source) => {
   }
 
   executeBundle(source, sandboxModules);
+  for (const channel of ["desktop:take-legacy-local-storage", "desktop:complete-legacy-local-storage"]) {
+    if (ipcCalls.has(channel)) {
+      throw new Error(`Workbench preload must not request legacy storage migration: ${channel}`);
+    }
+  }
 
   const desktopBridge = exposedGlobals.get("desktopBridge");
   const missingApis = expectedDesktopBridgeApis.filter(

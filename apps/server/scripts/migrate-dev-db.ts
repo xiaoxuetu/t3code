@@ -114,6 +114,15 @@ export class MigrateDevDbPhaseError extends Schema.TaggedError<MigrateDevDbPhase
   }
 }
 
+export class MigrateDevDbDisabledError extends Schema.TaggedError<MigrateDevDbDisabledError>()(
+  "MigrateDevDbDisabledError",
+  {},
+) {
+  override get message(): string {
+    return "Database import is unsupported in T3 Pstack Workbench. migrate-dev-db is disabled to keep official T3 data separate.";
+  }
+}
+
 export interface RunMigrateDevDbInput {
   readonly baseDir?: string | undefined;
   readonly source?: string | undefined;
@@ -615,11 +624,6 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   };
 });
 
-const formatSize = (bytes: number): string =>
-  bytes >= 1024 * 1024
-    ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-    : `${(bytes / 1024).toFixed(0)} KB`;
-
 export const migrateDevDbCommand = Command.make(
   "migrate-dev-db",
   {
@@ -635,38 +639,17 @@ export const migrateDevDbCommand = Command.make(
     ),
     baseDir: Flag.String("base-dir").pipe(
       Flag.optional,
-      Flag.withDescription("Isolated .t3 directory. Defaults to the current worktree's .t3."),
+      Flag.withDescription("Unavailable while Workbench database import is disabled."),
     ),
     source: Flag.String("source").pipe(
       Flag.optional,
-      Flag.withDescription("Source database. Defaults to ~/.t3/userdata/statev2.sqlite."),
+      Flag.withDescription("Unavailable: Workbench does not import existing databases."),
     ),
   },
-  ({ projects, threadsPerProject, baseDir, source }) =>
-    Effect.gen(function* () {
-      const result = yield* runMigrateDevDb({
-        projects,
-        threadsPerProject,
-        baseDir: Option.getOrUndefined(baseDir),
-        source: Option.getOrUndefined(source),
-      });
-      yield* Console.log("");
-      yield* Console.log(
-        `Dev database ready: ${result.databasePath} (${formatSize(result.sizeBytes)})`,
-      );
-      for (const project of result.projects) {
-        yield* Console.log(`  ${project.title}: ${project.threads} threads`);
-      }
-      yield* Console.log(`  ${result.eventCount} orchestration events kept`);
-      yield* Console.log(
-        result.executedMigrations.length === 0
-          ? "  Migrations: already current (no new migrations in this checkout)"
-          : `  Migrations applied: ${result.executedMigrations.join(", ")}`,
-      );
-    }),
+  () => Effect.fail(new MigrateDevDbDisabledError()),
 ).pipe(
   Command.withDescription(
-    "Rebuild the worktree dev database from a pruned snapshot of the real ~/.t3 data, then run migrations.",
+    "Disabled in T3 Pstack Workbench: official T3 database import is unsupported.",
   ),
 );
 

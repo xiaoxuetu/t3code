@@ -7,12 +7,10 @@ import * as NodePath from "node:path";
 import * as NetService from "@t3tools/shared/Net";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, describe, it } from "@effect/vitest";
-import * as ByteSize from "effect/ByteSize";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
@@ -454,6 +452,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           devUrl: undefined,
         });
 
+        assert.equal(env.T3_PSTACK_WORKBENCH_HOME, undefined);
         assert.equal(env.T3CODE_HOME, undefined);
       }),
     );
@@ -476,7 +475,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             devUrl: undefined,
           }).pipe(
             Effect.provideService(HostProcess.HomeDirectory, "/home/dev"),
-            Effect.map((env) => env.T3CODE_HOME),
+            Effect.map((env) => env.T3_PSTACK_WORKBENCH_HOME),
           );
 
         assert.equal(yield* homeFor("~/t3-dev"), path.join("/home/dev", "t3-dev"));
@@ -731,15 +730,14 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             Effect.provide(Layer.mergeAll(emptyConfigLayer, netServiceLayer, spawnerLayer)),
             Effect.provideService(HostProcess.Platform, "linux"),
             Effect.provideService(HostProcess.WorkingDirectory, input.cwd),
-            // No ~/.t3 here, so these runs never seed from this machine's install.
             Effect.provideService(HostProcess.HomeDirectory, input.cwd),
             Effect.provideService(
               HostProcess.Environment,
-              input.ambientHome === undefined ? {} : { T3CODE_HOME: input.ambientHome },
+              input.ambientHome === undefined ? {} : { T3_PSTACK_WORKBENCH_HOME: input.ambientHome },
             ),
           );
 
-          return captured?.T3CODE_HOME;
+          return captured?.T3_PSTACK_WORKBENCH_HOME;
         });
 
       it.effect("prefers an explicit --home-dir over the worktree default", () =>
@@ -764,11 +762,11 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             cwd: root,
             ambientHome: "/home/user/.t3",
           });
-          assert.equal(home, path.join(path.resolve(root), ".t3"));
+          assert.equal(home, path.join(path.resolve(root), ".t3-pstack-workbench"));
         }).pipe(Effect.scoped),
       );
 
-      it.effect("prefers the worktree .t3 over an ambient T3CODE_HOME", () =>
+      it.effect("prefers the worktree Workbench directory over an ambient T3_PSTACK_WORKBENCH_HOME", () =>
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const root = yield* makeWorktree;
@@ -777,11 +775,11 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             cwd: root,
             ambientHome: "/home/user/.t3",
           });
-          assert.equal(home, path.join(path.resolve(root), ".t3"));
+          assert.equal(home, path.join(path.resolve(root), ".t3-pstack-workbench"));
         }).pipe(Effect.scoped),
       );
 
-      it.effect("seeds a worktree database from ~/.t3 only when it has none", () =>
+      it.effect("never seeds a worktree database from upstream state", () =>
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const root = yield* makeWorktree;
@@ -814,12 +812,12 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             });
 
           assert.deepStrictEqual(yield* spawnedArgs(false), []);
-          const [seedArgs] = yield* spawnedArgs(undefined);
-          assert.includeMembers([...(seedArgs ?? [])], ["--base-dir", path.join(root, ".t3")]);
+          assert.deepStrictEqual(yield* spawnedArgs(undefined), []);
+          assert.deepStrictEqual(yield* spawnedArgs(true), []);
 
           // Either database means the worktree already has data.
           for (const name of ["state.sqlite", "statev2.sqlite"]) {
-            const file = path.join(root, ".t3", "userdata", name);
+            const file = path.join(root, ".t3-pstack-workbench", "userdata", name);
             NodeFS.mkdirSync(path.dirname(file), { recursive: true });
             NodeFS.writeFileSync(file, "");
             assert.deepStrictEqual(yield* spawnedArgs(undefined), []);
@@ -828,81 +826,34 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         }).pipe(Effect.scoped),
       );
 
-      it.effect.each([
-        { sourceBytes: 500 * 1024 * 1024 - 1, shouldSeed: true },
-        { sourceBytes: 500 * 1024 * 1024, shouldSeed: true },
-        { sourceBytes: 500 * 1024 * 1024 + 1, shouldSeed: false },
-      ])(
-        "checks source size before seeding an empty worktree: $sourceBytes bytes",
-        ({ sourceBytes, shouldSeed }) =>
-          Effect.gen(function* () {
-            const fs = yield* FileSystem.FileSystem;
-            const path = yield* Path.Path;
-            const root = yield* makeWorktree;
-            const home = path.join(root, "home");
-            const source = path.join(home, ".t3", "userdata", "statev2.sqlite");
-            NodeFS.mkdirSync(path.dirname(source), { recursive: true });
-            NodeFS.writeFileSync(source, "");
-            const spawned: Array<ReadonlyArray<string>> = [];
-            const warnings: Array<string> = [];
-            const spawnerLayer = Layer.succeed(
-              ChildProcessSpawner.ChildProcessSpawner,
-              ChildProcessSpawner.make((command) => {
-                spawned.push((command as unknown as { readonly args: ReadonlyArray<string> }).args);
-                return Effect.succeed(mockProcess(0));
-              }),
-            );
-
-            yield* runDevRunnerWithInput({ ...devServerInput, t3Home: undefined }).pipe(
-              Effect.provide([
-                emptyConfigLayer,
-                netServiceLayer,
-                spawnerLayer,
-                Logger.layer([
-                  Logger.make((options) => {
-                    if (options.logLevel === "Warn") warnings.push(String(options.message));
-                  }),
-                ]),
-              ]),
-              Effect.provideService(FileSystem.FileSystem, {
-                ...fs,
-                stat: (file) =>
-                  fs
-                    .stat(file)
-                    .pipe(
-                      Effect.map((info) =>
-                        file === source ? { ...info, size: ByteSize.bytes(sourceBytes) } : info,
-                      ),
-                    ),
-              }),
-              Effect.provideService(HostProcess.Platform, "linux"),
-              Effect.provideService(HostProcess.WorkingDirectory, root),
-              Effect.provideService(HostProcess.HomeDirectory, home),
-              Effect.provideService(HostProcess.Environment, {}),
-            );
-
-            assert.equal(
-              spawned.some((args) => args.some((arg) => arg.endsWith("migrate-dev-db.ts"))),
-              shouldSeed,
-            );
-            assert.deepStrictEqual(spawned.at(-1), [
-              "run",
-              "--filter=t3",
-              "dev",
-              ...devServerInput.runArgs,
-            ]);
-            if (shouldSeed) {
-              assert.deepStrictEqual(warnings, []);
-            } else {
-              assert.lengthOf(warnings, 1);
-              assert.include(warnings[0]!, source);
-              assert.include(warnings[0]!, "skipping automatic database seeding");
-              assert.include(warnings[0]!, "vp run migrate-dev-db");
-            }
-          }).pipe(Effect.scoped),
+      it.effect("does not inspect an upstream database during development startup", () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const root = yield* makeWorktree;
+          const home = path.join(root, "home");
+          const source = path.join(home, ".t3", "userdata", "statev2.sqlite");
+          const spawnerLayer = Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() => Effect.succeed(mockProcess(0))),
+          );
+          yield* runDevRunnerWithInput({ ...devServerInput, t3Home: undefined }).pipe(
+            Effect.provide([emptyConfigLayer, netServiceLayer, spawnerLayer]),
+            Effect.provideService(FileSystem.FileSystem, {
+              ...fs,
+              stat: (file) => file === source
+                ? Effect.die("Upstream database must not be inspected")
+                : fs.stat(file),
+            }),
+            Effect.provideService(HostProcess.Platform, "linux"),
+            Effect.provideService(HostProcess.WorkingDirectory, root),
+            Effect.provideService(HostProcess.HomeDirectory, home),
+            Effect.provideService(HostProcess.Environment, {}),
+          );
+        }).pipe(Effect.scoped),
       );
 
-      it.effect("falls back to an ambient T3CODE_HOME outside a worktree", () =>
+      it.effect("falls back to an ambient T3_PSTACK_WORKBENCH_HOME outside a worktree", () =>
         Effect.gen(function* () {
           const path = yield* Path.Path;
           const home = yield* spawnedHome({

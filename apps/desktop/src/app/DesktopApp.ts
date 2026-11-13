@@ -188,7 +188,7 @@ const bootstrap = Effect.gen(function* () {
   });
   yield* installDesktopIpcHandlers();
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
-  // Before any window: the preload merges these items before the app reads storage.
+  // Keep the compatibility lifecycle call; the Workbench service never reads or migrates profiles.
   yield* (yield* DesktopLegacyLocalStorage.DesktopLegacyLocalStorage).load(
     yield* (yield* DesktopAppIdentity.DesktopAppIdentity).resolveUserDataPath,
   );
