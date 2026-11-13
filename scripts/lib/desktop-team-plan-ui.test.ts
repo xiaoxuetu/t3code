@@ -5,6 +5,7 @@ it("refuses execution controls and names outside the exact metadata allowlist", 
   expect(isDesktopTeamPlanMetadataButton("Save goal")).toBe(true);
   for (const name of [
     "Prepare team",
+    "Refine team",
     "Continue team",
     "Send",
     "Run",

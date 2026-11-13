@@ -64,7 +64,10 @@ async function requireFixture(page: Page): Promise<void> {
 }
 
 async function openTaskPlan(page: Page): Promise<Locator> {
-  const details = page.getByRole("region", { name: "Thread details", exact: true });
+  const details = page
+    .getByRole("region", { name: "Thread details", exact: true })
+    .or(page.getByRole("dialog", { name: "Thread details", exact: true }))
+    .filter({ visible: true });
   if (!(await details.isVisible())) {
     const toggle = page.getByRole("button", { name: "Toggle thread details panel", exact: true });
     await visible(toggle);
@@ -99,7 +102,11 @@ function taskRow(
   plan: Locator,
   task: { readonly taskId: string; readonly title: string },
 ): Locator {
-  return taskRows(plan).filter({ hasText: `${task.taskId} · ${task.title}` });
+  return plan.locator(`[data-plan-task-id="${task.taskId}"]`);
+}
+
+function currentTaskText(row: Locator, text: string | RegExp): Locator {
+  return row.locator(":scope > p").filter({ hasText: text });
 }
 
 async function addTask(
@@ -151,36 +158,38 @@ export async function assertSavedDesktopTeamPlan(
     const [first, second] = DESKTOP_TEAM_PLAN_EXPECTED.tasks;
     const firstRow = taskRow(plan, first);
     const secondRow = taskRow(plan, second);
-    await visible(firstRow.getByText(/^r1\s*·\s*Priority 10\s*·\s*research\s*·\s*Confirmed$/));
     await visible(
-      secondRow.getByText(/^r2\s*·\s*Priority 5\s*·\s*research\s*·\s*Needs confirmation$/),
+      currentTaskText(firstRow, /^r1\s*·\s*Priority 10\s*·\s*research\s*·\s*Confirmed$/),
     );
-    await visible(firstRow.getByText(first.prompt, { exact: true }));
-    await visible(secondRow.getByText(second.prompt, { exact: true }));
-    await visible(secondRow.getByText(/^Dependencies:\s*T1\/r1$/));
-    await visible(firstRow.getByText(/^Dependencies:\s*None$/));
+    await visible(
+      currentTaskText(secondRow, /^r2\s*·\s*Priority 5\s*·\s*research\s*·\s*Needs confirmation$/),
+    );
+    await visible(currentTaskText(firstRow, first.prompt));
+    await visible(currentTaskText(secondRow, second.prompt));
+    await visible(currentTaskText(secondRow, /^Dependencies:\s*T1\/r1$/));
+    await visible(currentTaskText(firstRow, /^Dependencies:\s*None$/));
     await visible(
       taskRows(plan).first().getByText(`${second.taskId} · ${second.title}`, { exact: true }),
     );
     if ((await taskRows(plan).count()) !== 2) throw new Error("Unexpected synthetic task count.");
     for (const row of [firstRow, secondRow]) {
-      await visible(
-        row.getByText(
-          /^0 execution records\.\s*Run times and session links are in\s*Team tasks below\.$/,
-        ),
-      );
-      await visible(row.getByText("Executor: Unassigned", { exact: true }));
+      await visible(currentTaskText(row, /^0 execution records\./));
+      await visible(currentTaskText(row, /^Assigned executor:\s*Unassigned$/));
     }
     const history = secondRow.locator("details");
     const summary = history.locator("summary").filter({ hasText: "Earlier revisions (1)" });
     await visible(summary);
     if ((await history.getAttribute("open")) === null)
       await summary.click({ timeout: STEP_TIMEOUT_MS });
+    const revision = history.locator('[data-plan-revision="1"]');
+    const revisionText = revision.locator(":scope > p");
+    await visible(revisionText.filter({ hasText: /^r1\s*·\s*Synthetic scripts inventory\s*·/ }));
+    await visible(revisionText.filter({ hasText: /Acceptance:\s*pending$/ }));
+    await visible(revisionText.filter({ hasText: /^0 recorded executions$/ }));
     await visible(
-      history.getByText("r1 · Synthetic scripts inventory · pending · 0 execution records", {
-        exact: true,
-      }),
+      revisionText.filter({ hasText: DESKTOP_TEAM_PLAN_EXPECTED.originalSecondPrompt }),
     );
+    await visible(revisionText.filter({ hasText: /^Dependencies:\s*T1\/r1$/ }));
     return {
       savedPlanVisible: true,
       taskCount: 2,
@@ -234,7 +243,7 @@ export async function verifyDesktopTeamPlan(page: Page): Promise<DesktopTeamPlan
       priority: DESKTOP_TEAM_PLAN_EXPECTED.originalSecondPriority,
       dependency: true,
     });
-    await visible(taskRow(plan, second).getByText(/^Dependencies:\s*T1\/r1$/));
+    await visible(currentTaskText(taskRow(plan, second), /^Dependencies:\s*T1\/r1$/));
     step = "priority";
     await clickMetadataButton(taskRow(plan, second), "Edit task");
     await plan
@@ -242,7 +251,8 @@ export async function verifyDesktopTeamPlan(page: Page): Promise<DesktopTeamPlan
       .fill(String(second.priority));
     await clickMetadataButton(plan, "Save task");
     await visible(
-      taskRow(plan, second).getByText(
+      currentTaskText(
+        taskRow(plan, second),
         /^r1\s*·\s*Priority 5\s*·\s*research\s*·\s*Needs confirmation$/,
       ),
     );
