@@ -81,7 +81,7 @@ jobs:
       - name: Verify task logic, isolation boundaries and pstack provenance
         shell: bash
         run: |
-          node --test scripts/verify-team-tasks.test.mjs
+          node --test scripts/verify-team-tasks.test.mjs apps/desktop/scripts/boot-diagnostics.test.mjs
           node --experimental-vm-modules --test apps/desktop/scripts/verify-workbench-isolation.mjs
           node integrations/pstack/verify-upstream.mjs
       - name: Typecheck affected applications
@@ -98,7 +98,7 @@ jobs:
       - name: Run focused build and development regression tests
         working-directory: scripts
         shell: bash
-        run: vp test run --config ../vite.config.ts --dir . dev-runner.test.ts build-desktop-artifact.test.ts
+        run: vp test run --config ../vite.config.ts --dir . dev-runner.test.ts build-desktop-artifact.test.ts lib/desktop-smoke-process.test.ts smoke-desktop-app.test.ts
       - name: Verify desktop profile compatibility and preload boundaries
         working-directory: apps/desktop
         shell: bash
@@ -132,7 +132,13 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app" > macos-validation/codesign-verify.txt 2>&1
           codesign -dv --verbose=4 "$app" > macos-validation/codesign-details.txt 2>&1
           node --input-type=module -e 'import fs from "node:fs"; if (!fs.readFileSync("macos-validation/codesign-details.txt", "utf8").includes("Signature=adhoc")) throw new Error("Expected explicit ad-hoc preview signing")'
-          node scripts/smoke-desktop-app.ts --executable "$binary" --artifacts-dir macos-validation/launch
+          install_root="$RUNNER_TEMP/workbench-installed-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$install_root"
+          installed_app="$install_root/$(basename "$app")"
+          ditto "$app" "$installed_app"
+          codesign --verify --deep --strict --verbose=2 "$installed_app" > macos-validation/installed-codesign-verify.txt 2>&1
+          binary="$installed_app/Contents/MacOS/$executable"
+          T3_PSTACK_WORKBENCH_SMOKE_DIAGNOSTICS=1 node scripts/smoke-desktop-app.ts --executable "$binary" --expect-version "$BUILD_VERSION" --artifacts-dir macos-validation/launch
           printf '%s\n' 'Packaged startup and fixture thread passed. Download Gatekeeper behavior and real provider workflows remain unverified.' > macos-validation/STATUS.txt
       - name: Record checksums and preview scope
         shell: bash
@@ -151,7 +157,15 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: workbench-macos-arm64-validation
-          path: macos-validation/
+          # Keep evidence bounded: no screenshots, raw process output, logs or stack dumps.
+          path: |
+            macos-validation/codesign-verify.txt
+            macos-validation/codesign-details.txt
+            macos-validation/installed-codesign-verify.txt
+            macos-validation/minimum-system-version.txt
+            macos-validation/launch/phase.json
+            macos-validation/launch/version.json
+            macos-validation/STATUS.txt
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload macOS engineering preview
