@@ -2874,7 +2874,18 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           role: "Viewer",
         },
       ],
-      ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
+      ...(signed
+        ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") }
+        : /^\d+\.\d+\.\d+-workbench\.\d+$/.test(version)
+          ? {
+              // Explicitly sign this engineering preview without a certificate or notarization.
+              // The locked builder has no automatic ad-hoc fallback; its Electron frameworks
+              // cannot use hardened runtime library validation with an ad-hoc identity.
+              identity: "-",
+              hardenedRuntime: false,
+              notarize: false,
+            }
+          : {}),
       ...(macPasskeySigning
         ? {
             entitlements: macPasskeySigning.entitlementsPath,

@@ -24,10 +24,16 @@ jobs:
     timeout-minutes: 60
     env:
       BUILD_VERSION: ${{ inputs.version }}
-      T3_PSTACK_WORKBENCH_HOME: ${{ runner.temp }}/workbench-state
       T3_PSTACK_WORKBENCH_DEV_SEED: "0"
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
+      - name: Initialize isolated Workbench state
+        shell: bash
+        run: |
+          set -euo pipefail
+          workbench_state="$RUNNER_TEMP/t3-pstack-workbench-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$workbench_state"
+          printf 'T3_PSTACK_WORKBENCH_HOME=%s\n' "$workbench_state" >> "$GITHUB_ENV"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false

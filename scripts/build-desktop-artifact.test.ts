@@ -548,6 +548,23 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
+  it.effect("uses explicit ad-hoc signing only for unsigned Workbench previews", () =>
+    Effect.gen(function* () {
+      const preview = yield* createBuildConfig("mac", "dmg", "0.1.0-workbench.3", false, false, undefined, undefined);
+      assert.nestedPropertyVal(preview, "mac.identity", "-");
+      assert.nestedPropertyVal(preview, "mac.hardenedRuntime", false);
+      assert.nestedPropertyVal(preview, "mac.notarize", false);
+      assert.notNestedProperty(preview, "mac.sign");
+      for (const [version, signed] of [["0.1.0-workbench.3", true], ["0.1.0", false]] as const) {
+        const config = yield* createBuildConfig("mac", "dmg", version, signed, false, undefined, undefined);
+        assert.notNestedProperty(config, "mac.identity");
+        assert.notNestedProperty(config, "mac.hardenedRuntime");
+        assert.notNestedProperty(config, "mac.notarize");
+        if (signed) assert.nestedProperty(config, "mac.sign");
+      }
+    }),
+  );
+
   it.effect("names the Electron window class in the Linux desktop entry", () =>
     Effect.gen(function* () {
       const linux = yield* createBuildConfig(
