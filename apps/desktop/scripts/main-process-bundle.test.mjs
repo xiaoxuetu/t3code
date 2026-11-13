@@ -126,7 +126,9 @@ it("loads the emitted packaged boot entry and backend cache preload", async () =
         ),
         outDir: NodePath.join(directory, "dist-electron"),
         config: false,
-        cwd: directory,
+        // Production dependency externalization depends on this package's manifest.
+        // Keep output isolated, but use the same cwd as the real desktop build.
+        cwd: NodeURL.fileURLToPath(new URL("../", import.meta.url)),
         tsconfig: false,
         sourcemap: false,
         onSuccess: undefined,
@@ -151,10 +153,12 @@ it("loads the emitted packaged boot entry and backend cache preload", async () =
       ]) {
         const child = NodeChildProcess.spawnSync(process.execPath, args, {
           encoding: "utf8",
+          cwd: directory,
           env: {
             ...process.env,
             APPIMAGE: "",
             NODE_COMPILE_CACHE: undefined,
+            NODE_PATH: undefined,
             NODE_DISABLE_COMPILE_CACHE: disabled ? "1" : undefined,
             XDG_CACHE_HOME: directory,
             TMPDIR: directory,

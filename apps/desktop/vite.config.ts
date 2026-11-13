@@ -112,6 +112,8 @@ export default defineConfig({
       entry: ["src/boot.ts", "src/compileCache.ts", "src/serverCompileCache.ts"],
       clean: false,
       deps: {
+        // The pre-runtime cache loader cannot resolve workspace packages in an installed app.
+        alwaysBundle: (id) => id === "@t3tools/shared/forkIdentity",
         neverBundle: (id) => id === "./main.cjs" || id === "./compileCache.cjs",
       },
     },

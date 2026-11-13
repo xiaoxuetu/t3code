@@ -102,7 +102,7 @@ jobs:
       - name: Verify desktop profile compatibility and preload boundaries
         working-directory: apps/desktop
         shell: bash
-        run: vp test run --project unit src/app/DesktopLegacyLocalStorage.test.ts src/app/DesktopUserData.test.ts src/app/DesktopEnvironment.test.ts src/app/DesktopApp.test.ts scripts/verify-preload-bundle.test.mjs
+        run: vp test run --project unit src/app/DesktopLegacyLocalStorage.test.ts src/app/DesktopUserData.test.ts src/app/DesktopEnvironment.test.ts src/app/DesktopApp.test.ts scripts/verify-preload-bundle.test.mjs scripts/main-process-bundle.test.mjs
       - name: Build macOS arm64 DMG and ZIP
         shell: bash
         run: |
