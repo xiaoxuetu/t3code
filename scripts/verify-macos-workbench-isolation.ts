@@ -15,6 +15,7 @@ import {
   verifyDatabaseOwner,
   waitForOwnedProcessExit,
   MacIsolationProcessError,
+  type IsolationCommandFailure,
 } from "./lib/mac-isolation-process.ts";
 import {
   SIMPLE_FIXTURE_TITLE,
@@ -62,6 +63,7 @@ async function main() {
   let phase = "host-guard";
   let status = "failed";
   let failureCode: string | null = null;
+  let commandFailure: IsolationCommandFailure | null = null;
   let workspace: ReturnType<typeof createIsolationWorkspace> | undefined;
   const applications = new Set<Tracked>();
   let cleanupSafe = true;
@@ -158,9 +160,9 @@ async function main() {
       message: SIMPLE_FIXTURE_MESSAGE,
       unexpectedTitle: otherTitle,
     });
+    checks[`${kind}RealFixtureWindow`] = true;
     await verifyIdentity(tracked, kind, executable);
     await verifyDatabase(tracked, kind);
-    checks[`${kind}RealFixtureWindow`] = true;
     return { tracked, page };
   }
   async function persistedTitle(kind: Kind, title: string) {
@@ -315,6 +317,7 @@ async function main() {
       error instanceof MacIsolationProcessError
         ? error.code
         : "check-did-not-pass";
+    if (error instanceof MacIsolationProcessError) commandFailure = error.commandFailure ?? null;
     process.exitCode = 1;
   } finally {
     for (const tracked of applications) {
@@ -354,6 +357,7 @@ async function main() {
             status,
             phase,
             failureCode,
+            commandFailure,
             versions,
             checks,
             scope:

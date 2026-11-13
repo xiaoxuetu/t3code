@@ -19,14 +19,38 @@ type FailureCode =
   | "process-exit-unverified"
   | "process-exit-timeout";
 
+export interface IsolationCommandFailure {
+  readonly stage: "ps-ancestry" | "lsof-databases";
+  readonly reason: "timeout" | "spawn" | "nonzero" | "stderr" | "output-limit";
+  readonly exitCode: number | null;
+}
+
+function safeExitCode(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255
+    ? value
+    : null;
+}
+
 // @effect-diagnostics-next-line extendsNativeError:off - The host controller receives only fixed failure codes, without command output or paths.
 export class MacIsolationProcessError extends Error {
   readonly code: FailureCode;
+  readonly commandFailure?: IsolationCommandFailure;
 
-  constructor(code: FailureCode) {
+  constructor(code: FailureCode, commandFailure?: IsolationCommandFailure) {
     super(`Mac isolation process verification failed (${code}).`);
     this.name = "MacIsolationProcessError";
     this.code = code;
+    if (
+      commandFailure !== undefined &&
+      ["ps-ancestry", "lsof-databases"].includes(commandFailure.stage) &&
+      ["timeout", "spawn", "nonzero", "stderr", "output-limit"].includes(commandFailure.reason)
+    ) {
+      this.commandFailure = {
+        stage: commandFailure.stage,
+        reason: commandFailure.reason,
+        exitCode: safeExitCode(commandFailure.exitCode),
+      };
+    }
   }
 }
 
@@ -55,8 +79,26 @@ const runNativeCommand: IsolationCommandRunner = (executable, args) =>
         env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C", LC_ALL: "C" },
       },
       (error, stdout, stderr) => {
-        if (error) reject(new MacIsolationProcessError("command-failed"));
-        else resolve({ exitCode: 0, stdout, stderr });
+        const exitCode = error === null ? 0 : safeExitCode(error.code);
+        if (error === null || (exitCode !== null && !error.killed)) {
+          resolve({ exitCode, stdout, stderr });
+        } else {
+          const reason =
+            error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+              ? "output-limit"
+              : error.killed && error.signal === "SIGKILL"
+                ? "timeout"
+                : typeof error.code === "number"
+                  ? "nonzero"
+                  : "spawn";
+          reject(
+            new MacIsolationProcessError("command-failed", {
+              stage: executable === "/bin/ps" ? "ps-ancestry" : "lsof-databases",
+              reason,
+              exitCode,
+            }),
+          );
+        }
       },
     );
   });
@@ -67,17 +109,44 @@ function validPid(value: unknown): value is number {
 
 async function command(
   runCommand: IsolationCommandRunner,
+  stage: IsolationCommandFailure["stage"],
   executable: string,
   args: readonly string[],
+  missingOther?: string,
 ): Promise<string> {
   try {
     const result = await runCommand(executable, args);
-    if (result.exitCode !== 0 || result.stderr.trim() !== "") {
-      throw new MacIsolationProcessError("command-failed");
+    const fail = (reason: IsolationCommandFailure["reason"]): never => {
+      throw new MacIsolationProcessError("command-failed", {
+        stage,
+        reason,
+        exitCode: safeExitCode(result.exitCode),
+      });
+    };
+    if (result.stderr !== "") return fail("stderr");
+    // Apple lsof returns 1 for an unmatched file; -V proves only the expected other DB was missing.
+    // https://github.com/apple-oss-distributions/lsof/blob/main/lsof/main.c
+    if (result.exitCode === 1 && missingOther !== undefined) {
+      const diagnostic = `lsof: no file use located: ${missingOther}\n`;
+      const offset = result.stdout.indexOf(diagnostic);
+      if (
+        offset < 0 ||
+        (offset > 0 && result.stdout[offset - 1] !== "\n") ||
+        result.stdout.indexOf(diagnostic, offset + diagnostic.length) !== -1
+      ) {
+        return fail("nonzero");
+      }
+      return result.stdout.slice(0, offset) + result.stdout.slice(offset + diagnostic.length);
     }
+    if (result.exitCode !== 0) return fail("nonzero");
     return result.stdout;
-  } catch {
-    throw new MacIsolationProcessError("command-failed");
+  } catch (error) {
+    throw new MacIsolationProcessError(
+      "command-failed",
+      error instanceof MacIsolationProcessError && error.commandFailure?.stage === stage
+        ? error.commandFailure
+        : { stage, reason: "spawn", exitCode: null },
+    );
   }
 }
 
@@ -168,7 +237,12 @@ export async function verifyDatabaseOwner({
   for (let depth = 0; depth < 16; depth++) {
     if (!validPid(current) || current === electronPid || visited.has(current)) break;
     visited.add(current);
-    const output = await command(runCommand, "/bin/ps", ["-p", String(current), "-o", "ppid="]);
+    const output = await command(runCommand, "ps-ancestry", "/bin/ps", [
+      "-p",
+      String(current),
+      "-o",
+      "ppid=",
+    ]);
     const match = /^\s*(\d+)\s*$/.exec(output);
     if (match === null) break;
     const parent = Number(match[1]);
@@ -180,16 +254,13 @@ export async function verifyDatabaseOwner({
   }
   if (!descendant) throw new MacIsolationProcessError("runtime-not-descendant");
 
-  const output = await command(runCommand, "/usr/sbin/lsof", [
-    "-F",
-    "n",
-    "-a",
-    "-p",
-    String(pid),
-    "--",
-    ownDb,
+  const output = await command(
+    runCommand,
+    "lsof-databases",
+    "/usr/sbin/lsof",
+    ["-V", "-F", "n", "-a", "-p", String(pid), "--", ownDb, otherDb],
     otherDb,
-  ]);
+  );
   let matchedProcess = false;
   let openedOwnDb = false;
   let openedOtherDb = false;

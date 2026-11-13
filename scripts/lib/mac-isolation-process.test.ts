@@ -12,6 +12,17 @@ import {
 } from "./mac-isolation-process.ts";
 
 const PRIVATE_DETAIL = "private-command-output-and-path";
+const nativeCommand = vi.hoisted(() =>
+  vi.fn<
+    (
+      executable: string,
+      args: string[],
+      options: Record<string, unknown>,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => void
+  >(),
+);
+vi.mock("node:child_process", () => ({ execFile: nativeCommand }));
 
 async function fixture() {
   const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "mac-isolation-process-"));
@@ -76,6 +87,7 @@ async function rejectsWithoutRaw(action: Promise<unknown>, code: string) {
     expect(error).not.toHaveProperty("stdout");
     expect(error).not.toHaveProperty("stderr");
     expect(error).not.toHaveProperty("cause");
+    return error as MacIsolationProcessError;
   }
 }
 
@@ -97,10 +109,178 @@ it("checks all owned paths before observing exact ancestry and database files", 
     { executable: "/bin/ps", args: ["-p", "150", "-o", "ppid="] },
     {
       executable: "/usr/sbin/lsof",
-      args: ["-F", "n", "-a", "-p", "200", "--", input.ownDb, input.otherDb],
+      args: ["-V", "-F", "n", "-a", "-p", "200", "--", input.ownDb, input.otherDb],
     },
   ]);
 });
+
+it("accepts exit one only with the exact missing-other report and an owned database match", async () => {
+  await using input = await fixture();
+  const output = `p200\nn${input.ownDb}\nlsof: no file use located: ${input.otherDb}\n`;
+  const observed = observation(input, undefined, result(output, { exitCode: 1 }));
+  expect(await verifyDatabaseOwner({ ...input, ...observed })).toEqual({
+    runtimePid: 200,
+    ownedRuntime: true,
+    openedOwnDb: true,
+    openedOtherDb: false,
+  });
+  expect(observed.calls.filter((call) => call.executable === "/usr/sbin/lsof")).toHaveLength(1);
+});
+
+it("preserves native exit one output for the same strict two-file check", async () => {
+  await using input = await fixture();
+  nativeCommand.mockReset();
+  nativeCommand
+    .mockImplementationOnce((_executable, _args, _options, callback) => callback(null, "100\n", ""))
+    .mockImplementationOnce((_executable, _args, _options, callback) =>
+      callback(
+        Object.assign(new Error(PRIVATE_DETAIL), { code: 1 }),
+        `p200\nn${input.ownDb}\nlsof: no file use located: ${input.otherDb}\n`,
+        "",
+      ),
+    );
+  expect(await verifyDatabaseOwner(input)).toMatchObject({
+    ownedRuntime: true,
+    openedOwnDb: true,
+    openedOtherDb: false,
+  });
+  expect(nativeCommand).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  ["timeout", { killed: true, signal: "SIGKILL", code: null }, null],
+  ["spawn", { code: "ENOENT" }, null],
+  ["output-limit", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", killed: true }, null],
+  ["nonzero", { code: 7 }, 7],
+  ["nonzero", { code: 300 }, null],
+] as const)("keeps only fixed native %s diagnostics", async (reason, fields, exitCode) => {
+  await using input = await fixture();
+  nativeCommand.mockReset();
+  nativeCommand.mockImplementationOnce((_executable, _args, _options, callback) =>
+    callback(
+      Object.assign(new Error(PRIVATE_DETAIL), fields, {
+        stdout: PRIVATE_DETAIL,
+        cause: PRIVATE_DETAIL,
+      }),
+      PRIVATE_DETAIL,
+      "",
+    ),
+  );
+  const error = await rejectsWithoutRaw(verifyDatabaseOwner(input), "command-failed");
+  expect(error.commandFailure).toEqual({ stage: "ps-ancestry", reason, exitCode });
+  expect(nativeCommand.mock.calls[0]?.slice(0, 3)).toEqual([
+    "/bin/ps",
+    ["-p", "200", "-o", "ppid="],
+    {
+      shell: false,
+      encoding: "utf8",
+      timeout: 2_000,
+      maxBuffer: 16_384,
+      killSignal: "SIGKILL",
+      env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LANG: "C", LC_ALL: "C" },
+    },
+  ]);
+});
+
+it.each(["reject", "nonzero", "stderr"] as const)(
+  "records the ps stage for %s failures without querying files",
+  async (failure) => {
+    await using input = await fixture();
+    const runCommand = vi.fn<IsolationCommandRunner>(async () => {
+      if (failure === "reject") throw new Error(PRIVATE_DETAIL);
+      return result("100\n", {
+        exitCode: failure === "nonzero" ? 9 : 0,
+        stderr: failure === "stderr" ? PRIVATE_DETAIL : "",
+      });
+    });
+    const error = await rejectsWithoutRaw(
+      verifyDatabaseOwner({ ...input, runCommand }),
+      "command-failed",
+    );
+    expect(error.commandFailure).toEqual({
+      stage: "ps-ancestry",
+      reason: failure === "reject" ? "spawn" : failure,
+      exitCode: failure === "reject" ? null : failure === "nonzero" ? 9 : 0,
+    });
+    expect(runCommand).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.each(["warning", " ", "\n", "missing report"])(
+  "rejects any stderr for an otherwise exact exit-one match: %j",
+  async (stderr) => {
+    await using input = await fixture();
+    const output = `p200\nn${input.ownDb}\nlsof: no file use located: ${input.otherDb}\n`;
+    const error = await rejectsWithoutRaw(
+      verifyDatabaseOwner({
+        ...input,
+        ...observation(input, undefined, result(output, { exitCode: 1, stderr })),
+      }),
+      "command-failed",
+    );
+    expect(error.commandFailure).toEqual({
+      stage: "lsof-databases",
+      reason: "stderr",
+      exitCode: 1,
+    });
+  },
+);
+
+it.each([
+  ["no diagnostic", "command-failed"],
+  ["wrong path", "command-failed"],
+  ["missing own instead", "command-failed"],
+  ["partial line", "command-failed"],
+  ["duplicate diagnostic", "command-failed"],
+  ["prefixed diagnostic", "command-failed"],
+  ["unknown line", "lsof-unverified"],
+  ["own missing", "database-not-open"],
+  ["other opened", "cross-database-open"],
+  ["empty", "command-failed"],
+] as const)("does not accept an exit-one result with %s", async (scenario, code) => {
+  await using input = await fixture();
+  const fields = `p200\nn${input.ownDb}\n`;
+  const diagnostic = `lsof: no file use located: ${input.otherDb}\n`;
+  const output = {
+    "no diagnostic": fields,
+    "wrong path": `${fields}lsof: no file use located: ${PRIVATE_DETAIL}\n`,
+    "missing own instead": `${fields}lsof: no file use located: ${input.ownDb}\n`,
+    "partial line": fields + diagnostic.trimEnd(),
+    "duplicate diagnostic": fields + diagnostic + diagnostic,
+    "prefixed diagnostic": `${fields}unexpected:${diagnostic}`,
+    "unknown line": `${fields}${diagnostic}${PRIVATE_DETAIL}\n`,
+    "own missing": `p200\n${diagnostic}`,
+    "other opened": `${fields}n${input.otherDb}\n${diagnostic}`,
+    empty: "",
+  }[scenario];
+  await rejectsWithoutRaw(
+    verifyDatabaseOwner({
+      ...input,
+      ...observation(input, undefined, result(output, { exitCode: 1 })),
+    }),
+    code,
+  );
+});
+
+it.each([-1, 2, 256, 1.5, NaN, Infinity, null])(
+  "rejects exit code %j despite an exact missing-other report",
+  async (exitCode) => {
+    await using input = await fixture();
+    const output = `p200\nn${input.ownDb}\nlsof: no file use located: ${input.otherDb}\n`;
+    const error = await rejectsWithoutRaw(
+      verifyDatabaseOwner({
+        ...input,
+        ...observation(input, undefined, result(output, { exitCode })),
+      }),
+      "command-failed",
+    );
+    expect(error.commandFailure).toEqual({
+      stage: "lsof-databases",
+      reason: "nonzero",
+      exitCode: exitCode === 2 ? 2 : null,
+    });
+  },
+);
 
 it("rejects a failed ownership assertion before any process command", async () => {
   await using input = await fixture();
