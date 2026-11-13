@@ -83,6 +83,7 @@ import {
   RuntimeMode,
   ThreadLinkedPullRequest,
   ThreadId,
+  TeamPlanExecutionRef as TeamPlanExecutionRefSchema,
   TurnItemId,
   TrimmedNonEmptyString,
   managedRuntimeModeCeilingMessage,
@@ -195,6 +196,7 @@ import {
   appendTeamPlanDependencyHandoff,
   type TeamPlanDependencyFact,
 } from "./TeamPlanDependencyHandoff.ts";
+import { teamPlanReportTransition, type TeamPlanReportObservation } from "./TeamPlanReport.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   endOrphanedNativeSubagent,
@@ -615,6 +617,9 @@ function wakeWorkStartedAt(
 }
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
+const encodeTeamPlanExecutionRef = Schema.encodeEffect(
+  Schema.fromJsonString(TeamPlanExecutionRefSchema),
+);
 
 /** Unfinished runs (including queued) or open requests block moving a thread to another project. */
 export function threadHasUnfinishedWork(records: {
@@ -659,6 +664,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.mark-unread":
     case "thread.metadata.update":
     case "thread.team-plan.patch":
+    case "thread.team-plan.report":
     case "thread.pull-request.link":
     case "thread.pull-request.unlink":
     case "thread.pull-request-link.sync":
@@ -3964,7 +3970,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         reason: "execution-not-completed",
       });
     }
-    return { child, run };
+    return { child, run, task };
   });
 
   const dispatchTeamPlanPatch = Effect.fn("Orchestrator.dispatchTeamPlanPatch")(function* (
@@ -3991,7 +3997,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (operation.type === "confirm_plan" ||
           operation.type === "confirm_task" ||
           operation.type === "bind_execution" ||
-          operation.type === "set_dispatch_paused")
+          operation.type === "set_dispatch_paused" ||
+          operation.type === "set_dispatch_limits" ||
+          operation.type === "set_report_schedule")
       ) {
         return yield* new OrchestratorTeamPlanPatchError({
           commandId: command.commandId,
@@ -4086,6 +4094,87 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       threadId: command.threadId,
       occurredAt: now,
       payload: { threadId: command.threadId, plan: decided.plan },
+    });
+  });
+
+  const dispatchTeamPlanReport = Effect.fn("Orchestrator.dispatchTeamPlanReport")(function* (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.team-plan.report" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const parent = yield* projectionStore
+      .getThreadRecords(command.threadId, ["teamPlan", "subagents"])
+      .pipe(mapDispatchError(command));
+    if (
+      command.createdBy !== "system" ||
+      command.creationSource !== "server" ||
+      parent.thread.deletedAt !== null ||
+      parent.thread.archivedAt !== null ||
+      parent.teamPlan == null
+    ) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "report-owner-unavailable",
+      });
+    }
+    const now = yield* DateTime.now;
+    const input = {
+      plan: parent.teamPlan,
+      occurrence: {
+        threadId: command.threadId,
+        planCreatedAt: command.planCreatedAt,
+        generation: command.generation,
+        dueAt: command.dueAt,
+      },
+      observedAt: DateTime.formatIso(now),
+    };
+    const current = teamPlanReportTransition({ ...input, observations: [] });
+    if (!current.ok) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: current.reason,
+      });
+    }
+    const observations: Array<TeamPlanReportObservation> = [];
+    const observed = new Set<string>();
+    for (const task of parent.teamPlan.tasks) {
+      for (const revision of [...task.history, task]) {
+        for (const execution of revision.executions) {
+          const key = yield* encodeTeamPlanExecutionRef(execution).pipe(mapDispatchError(command));
+          if (observed.has(key)) continue;
+          observed.add(key);
+          const owned = parent.subagents.find((candidate) => candidate.id === execution.subagentId);
+          const mayReadChild =
+            owned?.origin === "app_owned" &&
+            owned.threadId === command.threadId &&
+            owned.childThreadId === execution.threadId &&
+            execution.threadId !== command.threadId;
+          const child = mayReadChild
+            ? yield* projectionStore
+                .getThreadRecords(execution.threadId, ["runs", "contextTransfers"])
+                .pipe(Effect.option)
+            : Option.none();
+          observations.push({ execution, task: owned ?? null, child: Option.getOrNull(child) });
+        }
+      }
+    }
+    const reported = teamPlanReportTransition({ ...input, observations });
+    if (!reported.ok) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: reported.reason,
+      });
+    }
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "team-plan.updated",
+      threadId: command.threadId,
+      occurredAt: now,
+      payload: { threadId: command.threadId, plan: reported.plan },
     });
   });
 
@@ -9307,6 +9396,39 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             threadId: command.parentThreadId,
             reason: reason ?? "missing-task",
           });
+        }
+        const concurrentLimit = teamPlan?.dispatchLimits?.maxConcurrentTasks;
+        if (concurrentLimit != null) {
+          const checked = new Set<string>();
+          let active = 0;
+          for (const task of teamPlan!.tasks) {
+            for (const revision of [...task.history, task]) {
+              for (const execution of revision.executions) {
+                if (checked.has(execution.subagentId)) continue;
+                checked.add(execution.subagentId);
+                const owned = yield* validateTeamPlanExecution(command, execution, false);
+                const settledTask =
+                  owned.task.status === "completed" ||
+                  owned.task.status === "failed" ||
+                  owned.task.status === "cancelled" ||
+                  owned.task.status === "interrupted";
+                const settledRun =
+                  owned.run.status === "completed" ||
+                  owned.run.status === "failed" ||
+                  owned.run.status === "cancelled" ||
+                  owned.run.status === "interrupted" ||
+                  owned.run.status === "rolled_back";
+                if (!settledTask || !settledRun) active += 1;
+                if (active >= concurrentLimit) {
+                  return yield* new OrchestratorTeamPlanPatchError({
+                    commandId: command.commandId,
+                    threadId: command.parentThreadId,
+                    reason: "concurrent-task-limit",
+                  });
+                }
+              }
+            }
+          }
         }
         const dependencies: Array<TeamPlanDependencyFact> = [];
         for (const dependency of plannedTask.dependencies) {
@@ -14804,6 +14926,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.team-plan.patch":
         yield* dispatchTeamPlanPatch(command, events);
         break;
+      case "thread.team-plan.report":
+        yield* dispatchTeamPlanReport(command, events);
+        break;
       case "thread.auto-settle": {
         // Recheck live state; changes and explicit overrides take precedence over the sweep snapshot.
         const thread = yield* projectionStore
@@ -15300,6 +15425,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.gen(function* () {
           // Plan identities survive provider sessions; unmet prerequisites must not poison that identity.
           if (command.type === "delegated_task.request" && command.planTaskRef !== undefined) {
+            return yield* cause;
+          }
+          if (command.type === "thread.team-plan.report") {
             return yield* cause;
           }
           // Refusals depend on modes the user can change; a recorded rejection would block the retry.

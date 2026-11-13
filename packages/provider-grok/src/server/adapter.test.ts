@@ -26,12 +26,14 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import type { AcpAdapterV2ExtensionContext } from "@t3tools/provider-acp/server/adapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import { GrokSettings } from "../settings.ts";
-import { makeGrokAdapterV2 } from "./adapter.ts";
+import { makeGrokAcpAdapterFlavor, makeGrokAdapterV2 } from "./adapter.ts";
+import type * as EffectAcpErrors from "effect-acp/errors";
 
 const layerTest = Layer.mergeAll(
   NodeServices.layer,
@@ -61,6 +63,140 @@ const ModelRequest = Schema.Struct({
   }),
 });
 const decodeModelRequest = Schema.decodeUnknownSync(Schema.fromJsonString(ModelRequest));
+
+const makeExtensionHarness = Effect.gen(function* () {
+  const handlers = new Map<
+    string,
+    (payload: unknown) => Effect.Effect<unknown, EffectAcpErrors.AcpError>
+  >();
+  const requests: Array<Parameters<AcpAdapterV2ExtensionContext["requestUserInput"]>[0]> = [];
+  const plans: Array<Parameters<AcpAdapterV2ExtensionContext["captureProposedPlan"]>[0]> = [];
+  let acknowledgements = 0;
+  const runtime: Pick<
+    AcpSessionRuntime.AcpSessionRuntime["Service"],
+    "handleExtRequest" | "handleExtNotification"
+  > = {
+    handleExtNotification: () => Effect.void,
+    handleExtRequest: (method, codec, handler) =>
+      Effect.sync(() => {
+        handlers.set(method, (payload) =>
+          handler(Schema.decodeUnknownSync(codec)(payload), {
+            requestId: "raw-request-1",
+            method,
+          }),
+        );
+      }),
+  };
+  const flavor = makeGrokAcpAdapterFlavor(
+    {
+      instanceId,
+      settings: DEFAULT_GROK_SETTINGS,
+      environment: {},
+      hostPlatform: "linux",
+      selfInvocation: yield* resolveSelfInvocation(),
+      makeRuntime: () => Effect.die("The extension fixture must not launch a runtime"),
+    },
+    "/home/grok-test",
+  );
+  const register = flavor.registerExtensions;
+  if (register === undefined) return yield* Effect.die("Grok extensions must be registered");
+  yield* register({
+    runtime: runtime as AcpSessionRuntime.AcpSessionRuntime["Service"],
+    reportProviderRetry: () => Effect.void,
+    finishSubagent: () => Effect.void,
+    applyBackgroundTaskMutation: () => Effect.void,
+    markSessionCompacted: () => Effect.void,
+    requestUserInput: (input) =>
+      Effect.sync(() => {
+        requests.push(input);
+        return {
+          answers: null,
+          acknowledgeNativeResponse: Effect.sync(() => {
+            acknowledgements += 1;
+          }),
+        };
+      }),
+    captureProposedPlan: (input) =>
+      Effect.sync(() => {
+        plans.push(input);
+      }),
+    lastProposedPlanMarkdown: Effect.succeed("# Fallback plan"),
+  });
+  return {
+    requests,
+    plans,
+    acknowledgements: () => acknowledgements,
+    request: (method: string, payload: unknown) => {
+      const handler = handlers.get(method);
+      return handler === undefined
+        ? Effect.die(`No Grok extension registered for ${method}`)
+        : handler(payload);
+    },
+  };
+});
+
+describe("Grok extension session ownership", () => {
+  it.effect.each([
+    { method: "x.ai/ask_user_question", wrapped: false },
+    { method: "x.ai/ask_user_question", wrapped: true },
+    { method: "_x.ai/ask_user_question", wrapped: false },
+    { method: "_x.ai/ask_user_question", wrapped: true },
+  ])(
+    "forwards the native question session for $method (wrapped: $wrapped)",
+    ({ method, wrapped }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeExtensionHarness;
+        const params = {
+          sessionId: "source-native-session",
+          toolCallId: "question-1",
+          mode: "default",
+          questions: [{ id: "choice", question: "Continue?", options: [{ label: "Yes" }] }],
+        };
+        const response = yield* harness.request(method, wrapped ? { method, params } : params);
+        assert.deepEqual(response, { outcome: "cancelled" });
+        assert.deepEqual(harness.requests, [
+          {
+            nativeSessionId: "source-native-session",
+            nativeItemId: "source-native-session:xai-question:question-1",
+            nativeRequestId: "question-1",
+            questions: [
+              {
+                id: "choice",
+                header: "Question",
+                question: "Continue?",
+                multiSelect: false,
+                options: [{ label: "Yes", description: "Yes" }],
+              },
+            ],
+          },
+        ]);
+        assert.equal(harness.acknowledgements(), 1);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { method: "x.ai/exit_plan_mode", wrapped: false },
+    { method: "x.ai/exit_plan_mode", wrapped: true },
+    { method: "_x.ai/exit_plan_mode", wrapped: false },
+    { method: "_x.ai/exit_plan_mode", wrapped: true },
+  ])("forwards the native plan session for $method (wrapped: $wrapped)", ({ method, wrapped }) =>
+    Effect.gen(function* () {
+      const harness = yield* makeExtensionHarness;
+      const params = {
+        sessionId: "source-native-session",
+        toolCallId: "plan-1",
+        planContent: "# Source plan",
+      };
+      yield* harness.request(method, wrapped ? { method, params } : params);
+      assert.deepEqual(harness.plans, [
+        {
+          nativeSessionId: "source-native-session",
+          planMarkdown: "# Source plan",
+        },
+      ]);
+    }).pipe(Effect.provide(layerTest)),
+  );
+});
 
 /** The model and effort writes Grok received, in wire order. */
 function modelWrites(requestLogPath: string): ReadonlyArray<string> {

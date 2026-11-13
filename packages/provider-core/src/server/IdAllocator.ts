@@ -142,11 +142,13 @@ export interface IdAllocatorV2Derive {
     readonly driver: ProviderDriverKind;
     readonly nativeThreadId: string;
     readonly providerInstanceId?: ProviderInstanceId;
+    readonly identityScope?: string;
   }) => ThreadId;
   readonly subagentThread: (input: {
     readonly driver: ProviderDriverKind;
     readonly nativeThreadId: string;
     readonly providerInstanceId?: ProviderInstanceId;
+    readonly identityScope?: string;
   }) => ThreadId;
   readonly run: (input: { readonly threadId: ThreadId; readonly ordinal: number }) => RunId;
   readonly runAttempt: (input: {
@@ -167,22 +169,27 @@ export interface IdAllocatorV2Derive {
     readonly driver: ProviderDriverKind;
     readonly nativeThreadId: string;
     readonly providerInstanceId?: ProviderInstanceId;
+    readonly identityScope?: string;
   }) => ProviderThreadId;
   readonly providerTurn: (input: {
     readonly driver: ProviderDriverKind;
     readonly nativeTurnId: string;
+    readonly identityScope?: string;
   }) => ProviderTurnId;
   readonly nodeFromProviderItem: (input: {
     readonly driver: ProviderDriverKind;
     readonly nativeItemId: string;
+    readonly identityScope?: string;
   }) => NodeId;
   readonly messageFromProviderItem: (input: {
     readonly driver: ProviderDriverKind;
     readonly nativeItemId: string;
+    readonly identityScope?: string;
   }) => MessageId;
   readonly turnItemFromProviderItem: (input: {
     readonly driver: ProviderDriverKind;
     readonly nativeItemId: string;
+    readonly identityScope?: string;
   }) => TurnItemId;
   readonly approvalNode: (input: { readonly requestId: RuntimeRequestId }) => NodeId;
   readonly approvalTurnItem: (input: { readonly requestId: RuntimeRequestId }) => TurnItemId;
@@ -201,10 +208,14 @@ const encodePart = (part: string | number): string => encodeURIComponent(String(
 const joinId = (prefix: string, ...parts: ReadonlyArray<string | number>): string =>
   [prefix, ...parts.map(encodePart)].join(":");
 
+const identityScopeParts = (scope: string | undefined) =>
+  scope === undefined ? [] : ["identity-scope-v3", scope];
+
 export function deriveThreadFromProviderThread(input: {
   readonly driver: ProviderDriverKind;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly nativeThreadId: string;
+  readonly identityScope?: string;
 }): ThreadId {
   return ThreadId.make(
     joinId(
@@ -214,6 +225,7 @@ export function deriveThreadFromProviderThread(input: {
       ...(input.providerInstanceId === undefined
         ? []
         : ["provider-instance", input.providerInstanceId]),
+      ...identityScopeParts(input.identityScope),
       "native-thread",
       input.nativeThreadId,
     ),
@@ -236,6 +248,7 @@ export function deriveProviderThread(input: {
   readonly driver: ProviderDriverKind;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly nativeThreadId: string;
+  readonly identityScope?: string;
 }): ProviderThreadId {
   return ProviderThreadId.make(
     joinId(
@@ -245,6 +258,7 @@ export function deriveProviderThread(input: {
       ...(input.providerInstanceId === undefined
         ? []
         : ["provider-instance", input.providerInstanceId]),
+      ...identityScopeParts(input.identityScope),
       "native-thread",
       input.nativeThreadId,
     ),
@@ -299,15 +313,47 @@ export const derive: IdAllocatorV2Derive = {
   providerThread: deriveProviderThread,
   providerTurn: (input) =>
     ProviderTurnId.make(
-      joinId("provider-turn", "provider", input.driver, "native-turn", input.nativeTurnId),
+      joinId(
+        "provider-turn",
+        "provider",
+        input.driver,
+        ...identityScopeParts(input.identityScope),
+        "native-turn",
+        input.nativeTurnId,
+      ),
     ),
   nodeFromProviderItem: (input) =>
-    NodeId.make(joinId("node", "provider", input.driver, "native-item", input.nativeItemId)),
+    NodeId.make(
+      joinId(
+        "node",
+        "provider",
+        input.driver,
+        ...identityScopeParts(input.identityScope),
+        "native-item",
+        input.nativeItemId,
+      ),
+    ),
   messageFromProviderItem: (input) =>
-    MessageId.make(joinId("message", "provider", input.driver, "native-item", input.nativeItemId)),
+    MessageId.make(
+      joinId(
+        "message",
+        "provider",
+        input.driver,
+        ...identityScopeParts(input.identityScope),
+        "native-item",
+        input.nativeItemId,
+      ),
+    ),
   turnItemFromProviderItem: (input) =>
     TurnItemId.make(
-      joinId("turn-item", "provider", input.driver, "native-item", input.nativeItemId),
+      joinId(
+        "turn-item",
+        "provider",
+        input.driver,
+        ...identityScopeParts(input.identityScope),
+        "native-item",
+        input.nativeItemId,
+      ),
     ),
   approvalNode: (input) => NodeId.make(joinId("node", "runtime-request", input.requestId)),
   approvalTurnItem: (input) =>

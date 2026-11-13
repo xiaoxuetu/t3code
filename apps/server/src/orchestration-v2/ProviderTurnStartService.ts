@@ -105,11 +105,12 @@ const isProviderAdapterOpenSessionError = Schema.is(
  * Claude refuses these before it reads the prompt: replacing a process running background work,
  * launch arguments whose appended system prompt or settings cannot be read, or MCP registration
  * that never answers while the query opens. A query that ends before the turn attaches (such as a
- * rejected resume point) never received the prompt either. ACP selection refusals also precede prompts.
+ * rejected resume point) never received the prompt either. ACP and Codex selection refusals precede prompts.
  */
 const PROMPT_REFUSAL_TAGS = [
   "AcpModelSelectionError",
   "AcpConfigurationSelectionError",
+  "CodexSelectionUnavailableError",
   "ClaudeBackgroundWorkBlocksQueryReplacementError",
   "ClaudeAppendSystemPromptFileError",
   "ClaudeAppendSystemPromptMissingValueError",
@@ -120,8 +121,10 @@ const PROMPT_REFUSAL_TAGS = [
 const refusedBeforePrompt = (error: unknown): boolean =>
   PROMPT_REFUSAL_TAGS.some((tag) => Predicate.isTagged(error, tag)) ||
   (isProviderAdapterProtocolError(error) &&
-    error.driver === CLAUDE_PROVIDER &&
-    error.detail === CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL) ||
+    (error.reason === "invalid_item_identity" ||
+      error.reason === "session_owner_mismatch" ||
+      (error.driver === CLAUDE_PROVIDER &&
+        error.detail === CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL))) ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
 const startFailureMessage = (error: Error): string => {
@@ -765,6 +768,7 @@ export const layer: Layer.Layer<
           providerSessionId,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
+          initialProviderThreadId: providerThread.id,
           ...(existingSessionProjection === undefined
             ? {}
             : { resumeFromSession: existingSessionProjection }),
@@ -776,6 +780,11 @@ export const layer: Layer.Layer<
             : {
                 initialProviderItemIdentityVersion:
                   providerThread.nativeMetadata.itemIdentityVersion,
+              }),
+          ...(providerThread.nativeMetadata?.itemIdentityScope === undefined
+            ? {}
+            : {
+                initialProviderItemIdentityScope: providerThread.nativeMetadata.itemIdentityScope,
               }),
         }),
       );

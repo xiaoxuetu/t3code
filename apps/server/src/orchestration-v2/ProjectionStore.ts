@@ -47,6 +47,7 @@ import type {
   ProviderTurnId,
   RunAttemptId,
   TeamPlan,
+  TeamPlanReportOccurrence,
 } from "@t3tools/contracts";
 import {
   IDLE_COMPACTION_TEXT,
@@ -68,6 +69,8 @@ import {
   OrchestrationV2SubagentJson as OrchestrationV2SubagentJsonSchema,
   OrchestrationV2TurnItemJson as OrchestrationV2TurnItemJsonSchema,
   TeamPlan as TeamPlanSchema,
+  TeamPlanReportOccurrence as TeamPlanReportOccurrenceSchema,
+  TeamPlanReportSchedule,
   orchestrationV2RunWorkStartedAt,
   RunId,
   MessageId,
@@ -597,6 +600,11 @@ export interface ProjectionStoreV2Shape {
   readonly getTeamPlan: (
     threadId: ThreadId,
   ) => Effect.Effect<TeamPlan | null, ProjectionStoreV2Error>;
+  /** Lightweight enabled report schedules, including future occurrences; never loads task content. */
+  readonly getTeamPlanReportCandidates: () => Effect.Effect<
+    ReadonlyArray<TeamPlanReportOccurrence>,
+    ProjectionStoreV2Error
+  >;
   readonly getLimitRecoveryCandidates: (options: {
     readonly now: DateTime.Utc;
     readonly autoResume: boolean;
@@ -1283,6 +1291,10 @@ const decodePlanJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2PlanArtifactSchema),
 );
 const decodeTeamPlanPayload = Schema.decodeUnknownEffect(Schema.fromJsonString(TeamPlanSchema));
+const decodeTeamPlanReportSchedule = Schema.decodeEffect(
+  Schema.fromJsonString(TeamPlanReportSchedule),
+);
+const decodeTeamPlanReportOccurrence = Schema.decodeUnknownEffect(TeamPlanReportOccurrenceSchema);
 const decodeTurnItemPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2TurnItemJsonSchema),
 );
@@ -5605,6 +5617,49 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       (effect, threadId) => effect.pipe(Effect.mapError(controlReadError(threadId))),
     );
 
+    const getTeamPlanReportCandidates = Effect.fn("ProjectionStore.getTeamPlanReportCandidates")(
+      function* () {
+        const rows = yield* sql<{
+          readonly thread_id: string;
+          readonly plan_created_at: unknown;
+          readonly schedule_json: string;
+        }>`
+          SELECT p.thread_id,
+            json_extract(p.payload_json, '$.createdAt') AS plan_created_at,
+            json_extract(p.payload_json, '$.reportSchedule') AS schedule_json
+          FROM orchestration_v2_projection_team_plans p
+          INNER JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+          WHERE t.deleted_at IS NULL
+            AND json_extract(t.payload_json, '$.archivedAt') IS NULL
+            AND json_extract(p.payload_json, '$.threadId') = p.thread_id
+            AND json_extract(p.payload_json, '$.reportSchedule.enabled') = 1
+          ORDER BY p.thread_id
+        `;
+        const candidates: TeamPlanReportOccurrence[] = [];
+        for (const row of rows) {
+          const schedule = yield* Effect.result(decodeTeamPlanReportSchedule(row.schedule_json));
+          if (Result.isFailure(schedule) || schedule.success.nextReportAt === null) continue;
+          const candidate = yield* Effect.result(
+            decodeTeamPlanReportOccurrence({
+              threadId: row.thread_id,
+              planCreatedAt: row.plan_created_at,
+              generation: schedule.success.generation,
+              dueAt: schedule.success.nextReportAt,
+            }),
+          );
+          // Invalid rows must not prevent another plan's report; never expose their payloads.
+          if (
+            Result.isSuccess(candidate) &&
+            Number.isFinite(Date.parse(candidate.success.planCreatedAt)) &&
+            Number.isFinite(Date.parse(candidate.success.dueAt))
+          )
+            candidates.push(candidate.success);
+        }
+        return candidates;
+      },
+      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+    );
+
     const getPendingNativeUserInputs: ProjectionStoreV2Shape["getPendingNativeUserInputs"] = (
       threadId,
       providerTurnId,
@@ -9042,6 +9097,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
       getThread: readOnReader(getThread),
       getTeamPlan: readOnReader(getTeamPlan),
+      getTeamPlanReportCandidates: readOnReader(getTeamPlanReportCandidates),
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadTitles: readOnReader(getThreadTitles),

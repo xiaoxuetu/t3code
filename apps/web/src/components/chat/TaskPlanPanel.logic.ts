@@ -1,11 +1,44 @@
 import { teamPlanTaskRevision } from "@t3tools/shared/teamPlan";
-import type {
+import {
+  MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
   TeamPlan,
-  TeamPlanDependency,
-  TeamPlanOperation,
-  TeamPlanPatch,
-  TeamPlanTask,
+  type TeamPlanDependency,
+  type TeamPlanDispatchLimits,
+  type TeamPlanOperation,
+  type TeamPlanPatch,
+  TeamPlanReportSchedule,
+  type TeamPlanTask,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
+// Report ticks can advance CAS without changing anything the user is editing.
+const sameEditablePlan = Schema.toEquivalence(
+  TeamPlan.mapFields(
+    ({ version: _version, updatedAt: _updatedAt, latestReport: _latestReport, ...fields }) => ({
+      ...fields,
+      reportSchedule: Schema.optionalKey(
+        TeamPlanReportSchedule.mapFields(
+          ({ nextReportAt: _nextReportAt, ...scheduleFields }) => scheduleFields,
+        ),
+      ),
+    }),
+  ),
+);
+
+export function taskPlanEditorSaveVersion(
+  baseline: TeamPlan | null,
+  current: TeamPlan | null,
+): number | null {
+  if (baseline === null || current === null) return baseline === current ? 0 : null;
+  if (
+    current.version < baseline.version ||
+    current.threadId !== baseline.threadId ||
+    current.createdAt !== baseline.createdAt
+  ) {
+    return null;
+  }
+  return sameEditablePlan(baseline, current) ? current.version : null;
+}
 
 export interface TaskPlanDraft {
   readonly title: string;
@@ -13,6 +46,79 @@ export interface TaskPlanDraft {
   readonly role: string;
   readonly priority: string;
   readonly dependencies: ReadonlyArray<TeamPlanDependency>;
+}
+
+export interface TaskPlanDispatchLimitsDraft {
+  readonly maxConcurrentTasks: string;
+  readonly maxTaskExecutions: string;
+}
+
+export function taskPlanDispatchLimitsDraft(
+  limits: TeamPlanDispatchLimits | undefined,
+): TaskPlanDispatchLimitsDraft {
+  return {
+    maxConcurrentTasks: limits?.maxConcurrentTasks?.toString() ?? "",
+    maxTaskExecutions: limits?.maxTaskExecutions?.toString() ?? "",
+  };
+}
+
+function parseDispatchLimit(value: string): number | null | undefined {
+  const text = value.trim();
+  if (!text) return null;
+  if (!/^\d+$/u.test(text)) return undefined;
+  const limit = Number(text);
+  return Number.isSafeInteger(limit) && limit > 0 ? limit : undefined;
+}
+
+export function taskPlanDispatchLimitsOperations(
+  draft: TaskPlanDispatchLimitsDraft,
+  original: TeamPlanDispatchLimits | undefined,
+):
+  | { readonly ok: true; readonly operations: ReadonlyArray<TeamPlanOperation> }
+  | { readonly ok: false; readonly message: string } {
+  const maxConcurrentTasks = parseDispatchLimit(draft.maxConcurrentTasks);
+  const maxTaskExecutions = parseDispatchLimit(draft.maxTaskExecutions);
+  if (maxConcurrentTasks === undefined || maxTaskExecutions === undefined) {
+    return {
+      ok: false,
+      message: `${maxConcurrentTasks === undefined ? "Concurrent task limit" : "Total task executions"} must be a positive safe whole number, or left empty.`,
+    };
+  }
+  if (
+    maxConcurrentTasks === (original?.maxConcurrentTasks ?? null) &&
+    maxTaskExecutions === (original?.maxTaskExecutions ?? null)
+  ) {
+    return { ok: true, operations: [] };
+  }
+  return {
+    ok: true,
+    operations: [
+      { type: "set_dispatch_limits", limits: { maxConcurrentTasks, maxTaskExecutions } },
+    ],
+  };
+}
+
+export function taskPlanReportScheduleOperations(
+  value: string,
+  original: TeamPlanReportSchedule | undefined,
+):
+  | { readonly ok: true; readonly operations: ReadonlyArray<TeamPlanOperation> }
+  | { readonly ok: false; readonly message: string } {
+  const minutes = parseDispatchLimit(value);
+  const everyMs = typeof minutes === "number" ? minutes * MIN_TEAM_PLAN_REPORT_INTERVAL_MS : null;
+  if (everyMs === null || !Number.isSafeInteger(everyMs)) {
+    return {
+      ok: false,
+      message: "Enter a positive whole number of minutes within the safe range.",
+    };
+  }
+  if (original?.enabled && original.everyMs === everyMs) {
+    return { ok: true, operations: [] };
+  }
+  return {
+    ok: true,
+    operations: [{ type: "set_report_schedule", enabled: true, everyMs }],
+  };
 }
 
 export function taskPlanCoordinatorPatch(

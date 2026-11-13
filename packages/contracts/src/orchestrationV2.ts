@@ -45,6 +45,7 @@ import { AuthMcpClientAccess } from "./auth.ts";
 import { ChatAttachment } from "./chatAttachment.ts";
 import { ThreadGuestShare } from "./guestShare.ts";
 import { TeamPlan, TeamPlanPatch, TeamPlanTaskRef } from "./teamPlan.ts";
+import { TeamPlanReportOccurrence } from "./teamPlanReport.ts";
 import { StoredThreadTags, ThreadTag } from "./threadTags.ts";
 import { ThreadTitleRegenerationOutcome } from "./threadTitle.ts";
 import {
@@ -1076,12 +1077,19 @@ export const OrchestrationV2ProviderThreadNativeMetadata = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
   title: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   updatedAt: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
-  itemIdentityVersion: Schema.optional(Schema.Literal(2)),
+  itemIdentityVersion: Schema.optional(Schema.Literals([2, 3])),
+  itemIdentityScope: Schema.optional(TrimmedNonEmptyString),
   forkHeadMessageId: Schema.optional(TrimmedNonEmptyString),
   claudeAttachmentBudget: Schema.optional(
     Schema.Struct({ bytesUsed: NonNegativeInt, pagesUsed: NonNegativeInt }),
   ),
-});
+}).check(
+  Schema.makeFilter(
+    (metadata) =>
+      (metadata.itemIdentityVersion === 3) === (metadata.itemIdentityScope !== undefined) ||
+      "ACP identity version 3 requires its persisted item scope.",
+  ),
+);
 export type OrchestrationV2ProviderThreadNativeMetadata =
   typeof OrchestrationV2ProviderThreadNativeMetadata.Type;
 
@@ -3523,6 +3531,14 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
 
 // Excluded from dispatchCommand so only the server can send these.
 const OrchestrationV2InternalCommand = Schema.Union([
+  // Passive snapshots only; excluded from RPC/client commands and never starts a provider run.
+  Schema.Struct({
+    type: Schema.Literal("thread.team-plan.report"),
+    commandId: CommandId,
+    ...TeamPlanReportOccurrence.fields,
+    createdBy: Schema.Literal("system"),
+    creationSource: Schema.Literal("server"),
+  }),
   // Guest share commands the server issues after checking T3 Connect and the guest token.
   Schema.Struct({
     type: Schema.Literal("thread.guest-share.open"),

@@ -1707,7 +1707,22 @@ describe("AcpRegistryAdapterV2", () => {
           { usedTokens: 2_500, maxTokens: 10_000, cost: { amount: 0.42, currency: "USD" } },
         ],
       );
+      const rootMetadata = session.providerThread.nativeMetadata;
+      assert.equal(rootMetadata?.itemIdentityVersion, 3);
+      const rootIdentityScope = rootMetadata?.itemIdentityScope;
+      if (rootIdentityScope === undefined || rootIdentityScope.length === 0)
+        throw new Error("Missing persisted root identity scope");
+      assert.isTrue(
+        childThreads.every(
+          (thread) =>
+            thread.nativeMetadata?.itemIdentityVersion === 3 &&
+            thread.nativeMetadata.itemIdentityScope === rootIdentityScope,
+        ),
+        "native child updates retain their root conversation's persisted identity scope",
+      );
       assert.deepEqual(childThreads.at(-1)?.nativeMetadata, {
+        itemIdentityVersion: 3,
+        itemIdentityScope: rootIdentityScope,
         title: "Child review",
         updatedAt: "2026-10-19T00:00:00Z",
       });

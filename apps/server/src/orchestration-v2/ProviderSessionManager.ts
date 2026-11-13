@@ -224,7 +224,9 @@ export interface ProviderSessionManagerV2Shape {
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly resumeFromSession?: OrchestrationV2ProviderSession;
     readonly initialNativeThreadId?: string;
-    readonly initialProviderItemIdentityVersion?: 2;
+    readonly initialProviderThreadId?: ProviderThreadId;
+    readonly initialProviderItemIdentityVersion?: 2 | 3;
+    readonly initialProviderItemIdentityScope?: string;
   }) => Effect.Effect<
     ProviderAdapter.ProviderAdapterV2SessionRuntime,
     ProviderSessionManagerV2Error
@@ -376,9 +378,13 @@ function providerThreadRuntimeKey(
   >[0]["providerThread"],
 ): string {
   const nativeThreadRef = providerThread.nativeThreadRef;
-  return nativeThreadRef === null
-    ? String(providerThread.id)
-    : `${nativeThreadRef.driver}:${nativeThreadRef.nativeId}`;
+  return JSON.stringify([
+    providerThread.id,
+    nativeThreadRef?.driver ?? null,
+    nativeThreadRef?.nativeId ?? null,
+    providerThread.nativeMetadata?.itemIdentityVersion ?? null,
+    providerThread.nativeMetadata?.itemIdentityScope ?? null,
+  ]);
 }
 
 function providerThreadLoadKey(input: {
@@ -2920,11 +2926,19 @@ export const layerWithOptions = (
                     ...(input.initialNativeThreadId === undefined
                       ? {}
                       : { initialNativeThreadId: input.initialNativeThreadId }),
+                    ...(input.initialProviderThreadId === undefined
+                      ? {}
+                      : { initialProviderThreadId: input.initialProviderThreadId }),
                     ...(input.initialProviderItemIdentityVersion === undefined
                       ? {}
                       : {
                           initialProviderItemIdentityVersion:
                             input.initialProviderItemIdentityVersion,
+                        }),
+                    ...(input.initialProviderItemIdentityScope === undefined
+                      ? {}
+                      : {
+                          initialProviderItemIdentityScope: input.initialProviderItemIdentityScope,
                         }),
                   }),
                 )

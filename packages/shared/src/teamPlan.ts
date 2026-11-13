@@ -1,5 +1,6 @@
 import {
   CommandId,
+  MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
   type TeamPlan,
   type TeamPlanDependency,
   type TeamPlanExecutionRef,
@@ -9,6 +10,8 @@ import {
   type TeamPlanTaskRevision,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
 
 type Mutable<T> = T extends string | number | boolean | null | undefined
   ? T
@@ -80,6 +83,16 @@ export function teamPlanTaskRevision(
     : task.history.find((entry) => entry.revision === revision);
 }
 
+export function teamPlanExecutionCount(plan: TeamPlan): number {
+  return new Set(
+    plan.tasks.flatMap((task) =>
+      [...task.history, task].flatMap((revision) =>
+        revision.executions.map((execution) => execution.subagentId),
+      ),
+    ),
+  ).size;
+}
+
 /** This checks only planning prerequisites. The server still validates live provider access and actual execution refs. */
 export function teamPlanTaskReadiness(
   plan: TeamPlan,
@@ -93,6 +106,11 @@ export function teamPlanTaskReadiness(
     return { ready: false, reason: "unassigned-model" };
   if (task.confirmedRevision !== task.revision) return { ready: false, reason: "unconfirmed-task" };
   if (task.executions.length > 0) return { ready: false, reason: "already-dispatched" };
+  if (
+    plan.dispatchLimits?.maxTaskExecutions != null &&
+    teamPlanExecutionCount(plan) >= plan.dispatchLimits.maxTaskExecutions
+  )
+    return { ready: false, reason: "task-execution-limit" };
   if (task.acceptance.status !== "pending")
     return { ready: false, reason: `task-${task.acceptance.status}` };
   for (const dependency of task.dependencies) {
@@ -117,6 +135,20 @@ export function validateTeamPlan(plan: TeamPlan): TeamPlanPatchFailure | null {
     !Number.isSafeInteger(plan.revision) ||
     plan.revision < 1 ||
     (plan.dispatchPaused !== undefined && typeof plan.dispatchPaused !== "boolean") ||
+    (plan.dispatchLimits !== undefined &&
+      [plan.dispatchLimits.maxConcurrentTasks, plan.dispatchLimits.maxTaskExecutions].some(
+        (limit) => limit !== null && (!Number.isSafeInteger(limit) || limit < 1),
+      )) ||
+    (plan.reportSchedule !== undefined &&
+      (!Number.isSafeInteger(plan.reportSchedule.everyMs) ||
+        plan.reportSchedule.everyMs < MIN_TEAM_PLAN_REPORT_INTERVAL_MS ||
+        !Number.isSafeInteger(plan.reportSchedule.generation) ||
+        plan.reportSchedule.generation < 1 ||
+        typeof plan.reportSchedule.enabled !== "boolean" ||
+        (plan.reportSchedule.enabled
+          ? plan.reportSchedule.nextReportAt === null ||
+            !Number.isFinite(Date.parse(plan.reportSchedule.nextReportAt))
+          : plan.reportSchedule.nextReportAt !== null))) ||
     (plan.confirmedRevision !== null && plan.confirmedRevision !== plan.revision)
   )
     return { code: "invalid-operation" };
@@ -235,6 +267,41 @@ export function applyTeamPlanPatch(
       if (operation.type === "set_dispatch_paused") {
         if (typeof operation.paused !== "boolean") return reject("invalid-operation");
         plan.dispatchPaused = operation.paused;
+        continue;
+      }
+      if (operation.type === "set_dispatch_limits") {
+        plan.dispatchLimits = structuredClone(operation.limits);
+        continue;
+      }
+      if (operation.type === "set_report_schedule") {
+        if (
+          typeof operation.enabled !== "boolean" ||
+          !Number.isSafeInteger(operation.everyMs) ||
+          operation.everyMs < MIN_TEAM_PLAN_REPORT_INTERVAL_MS
+        )
+          return reject("invalid-operation");
+        const previous = plan.reportSchedule;
+        if (previous?.enabled === operation.enabled && previous.everyMs === operation.everyMs)
+          continue;
+        const generation = (previous?.generation ?? 0) + 1;
+        if (!Number.isSafeInteger(generation)) return reject("invalid-operation");
+        let nextReportAt: string | null = null;
+        if (operation.enabled) {
+          const now = DateTime.make(context.now);
+          if (Option.isNone(now)) return reject("invalid-operation");
+          const nextMs = DateTime.toEpochMillis(now.value) + operation.everyMs;
+          const next = DateTime.make(nextMs);
+          if (!Number.isSafeInteger(nextMs) || Option.isNone(next))
+            return reject("invalid-operation");
+          nextReportAt = DateTime.formatIso(next.value);
+          if (!/^\d{4}-/.test(nextReportAt)) return reject("invalid-operation");
+        }
+        plan.reportSchedule = {
+          enabled: operation.enabled,
+          everyMs: operation.everyMs,
+          generation,
+          nextReportAt,
+        };
         continue;
       }
       if (operation.type === "set_goal") {

@@ -156,6 +156,95 @@ describe("CodexAdapterV2 assistant message streaming", () => {
 });
 
 describe("CodexAdapterV2 runtime policy", () => {
+  it.effect.each(
+    [
+      "omitted service tier",
+      "unrecognized cyber program",
+      "unhandled advertised option",
+      "duplicate effort",
+    ].flatMap((scenario) => [
+      { scenario, selectionPolicy: "strict" as const },
+      { scenario, selectionPolicy: "compatible" as const },
+    ]),
+  )(
+    "$selectionPolicy Codex selection rejects silent substitutions for $scenario",
+    ({ scenario, selectionPolicy }) =>
+      Effect.gen(function* () {
+        const id =
+          scenario === "omitted service tier"
+            ? "serviceTier"
+            : scenario === "unrecognized cyber program"
+              ? "cyberAccessProgram"
+              : scenario === "unhandled advertised option"
+                ? "providerOnlySetting"
+                : "reasoningEffort";
+        const value =
+          scenario === "omitted service tier"
+            ? "fast"
+            : scenario === "unrecognized cyber program"
+              ? "future-program"
+              : "high";
+        const result = yield* Effect.result(
+          CodexAdapterV2.buildCodexTurnStartParams({
+            nativeThreadId: "strict-options",
+            codexInput: [{ type: "text", text: "fixture" }],
+            runtimePolicy: {
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              cwd: null,
+              selectionPolicy,
+            },
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("codex"),
+              model: "gpt-5.4",
+              options: [
+                { id, value },
+                ...(scenario === "duplicate effort" ? [{ id, value: "low" }] : []),
+              ],
+            },
+            models: [
+              {
+                slug: "gpt-5.4",
+                name: "Fixture model",
+                isCustom: false,
+                capabilities: {
+                  optionDescriptors: [
+                    {
+                      id,
+                      label: "Fixture option",
+                      type: "select",
+                      options: [
+                        { id: value, label: value },
+                        { id: "low", label: "Low" },
+                      ],
+                    },
+                  ],
+                },
+              },
+            ],
+            ...(scenario === "omitted service tier" ? { omitServiceTier: true } : {}),
+            ...(scenario === "unrecognized cyber program"
+              ? { cyberAccess: { defaultProgram: "standard" } }
+              : {}),
+          }),
+        );
+        if (selectionPolicy === "strict") {
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.isTrue(Predicate.isTagged(result.failure, "CodexSelectionUnavailableError"));
+          }
+        } else {
+          assert.equal(result._tag, "Success");
+          if (result._tag !== "Success") return;
+          if (scenario === "omitted service tier")
+            assert.notProperty(result.success, "serviceTier");
+          if (scenario === "unrecognized cyber program")
+            assert.equal(result.success.cyberAccessProgram, "standard");
+          if (scenario === "duplicate effort") assert.equal(result.success.effort, "high");
+        }
+      }),
+  );
+
   it.effect.each([undefined, false, true])(
     "selects native collaboration modes without prompt overrides with hasT3Mcp=%s",
     (hasT3Mcp) =>
@@ -1512,6 +1601,290 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         awaitTerminal: (count: number) => changes.until(() => terminalEvents().length >= count),
       };
     });
+
+  it.effect.each(
+    [
+      { scenario: "missing-catalog", rejectsStrict: true },
+      { scenario: "unlisted-model", rejectsStrict: true },
+      { scenario: "custom-model", rejectsStrict: true },
+      { scenario: "missing-effort", rejectsStrict: true },
+      { scenario: "unlisted-effort", rejectsStrict: true },
+      { scenario: "boolean-effort", rejectsStrict: true },
+      { scenario: "advertised-future-effort", rejectsStrict: false },
+      { scenario: "available-effort", rejectsStrict: false },
+      { scenario: "implicit-effort", rejectsStrict: false },
+    ].flatMap((scenario) => [
+      { ...scenario, selectionPolicy: "strict" as const },
+      { ...scenario, selectionPolicy: "compatible" as const },
+    ]),
+  )(
+    "$selectionPolicy Codex selection handles $scenario before turn/start",
+    ({ scenario, rejectsStrict, selectionPolicy }) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `native-selection-${scenario}`;
+        const nativeTurnId = `turn-selection-${scenario}`;
+        const explicitEffort = !["missing-catalog", "unlisted-model", "implicit-effort"].includes(
+          scenario,
+        );
+        const selectedEffort = scenario === "advertised-future-effort" ? "future-effort" : "high";
+        const expectedEffort =
+          explicitEffort && scenario !== "boolean-effort" ? selectedEffort : undefined;
+        const requests: Array<unknown> = [];
+        const models: ReadonlyArray<ServerProviderModel> =
+          scenario === "missing-catalog"
+            ? []
+            : [
+                {
+                  slug:
+                    scenario === "unlisted-model"
+                      ? "another-model"
+                      : CODEX_TEST_MODEL_SELECTION.model,
+                  name: "Fixture model",
+                  isCustom: scenario === "custom-model",
+                  capabilities:
+                    scenario === "missing-effort"
+                      ? null
+                      : {
+                          optionDescriptors: [
+                            {
+                              id: "reasoningEffort",
+                              label: "Reasoning effort",
+                              type: "select",
+                              options:
+                                scenario === "unlisted-effort"
+                                  ? [{ id: "low", label: "Low" }]
+                                  : [{ id: selectedEffort, label: "Selected effort" }],
+                            },
+                          ],
+                        },
+                },
+              ];
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `selection-${selectionPolicy}-${scenario}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId,
+                prompt: "Execute the selected task",
+                ...(expectedEffort === undefined ? {} : { effort: expectedEffort }),
+              }),
+              {
+                type: "emit_inbound",
+                label: "turn/completed",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  },
+                },
+              },
+            ],
+          }),
+          undefined,
+          (method, params) =>
+            Effect.sync(() => {
+              if (method === "turn/start") requests.push(params);
+            }),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          Effect.succeed(models),
+        );
+        const result = yield* Effect.exit(
+          harness.runtime.startTurn({
+            ...makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make(`selection-${scenario}`),
+              text: "Execute the selected task",
+            }),
+            modelSelection: {
+              ...CODEX_TEST_MODEL_SELECTION,
+              ...(explicitEffort
+                ? {
+                    options: [
+                      {
+                        id: "reasoningEffort",
+                        value: scenario === "boolean-effort" ? true : selectedEffort,
+                      },
+                    ],
+                  }
+                : {}),
+            },
+            runtimePolicy: { ...CODEX_TEST_RUNTIME_POLICY, selectionPolicy },
+          }),
+        );
+        if (selectionPolicy === "strict" && rejectsStrict) {
+          assert.lengthOf(requests, 0, "an unverified explicit choice must not send turn/start");
+          assert.isTrue(Exit.isFailure(result), "strict selection cannot use provider defaults");
+          const error = Exit.isFailure(result) ? Cause.squash(result.cause) : undefined;
+          assert.instanceOf(error, ProviderAdapter.ProviderAdapterTurnStartError);
+          const rejection = (error as ProviderAdapter.ProviderAdapterTurnStartError).cause;
+          assert.isTrue(Predicate.isTagged(rejection, "CodexSelectionUnavailableError"));
+          if (Predicate.hasProperty(rejection, "reason")) {
+            assert.equal(
+              rejection.reason,
+              ["missing-catalog", "unlisted-model", "custom-model"].includes(scenario)
+                ? "model_unavailable"
+                : "option_unavailable",
+            );
+          }
+        } else {
+          assert.isTrue(
+            Exit.isSuccess(result),
+            Exit.isFailure(result) ? Cause.pretty(result.cause) : "",
+          );
+          yield* harness.firstTerminal;
+          assert.lengthOf(requests, 1);
+          const sent = requests[0] as Record<string, unknown>;
+          assert.equal(sent.model, CODEX_TEST_MODEL_SELECTION.model);
+          assert.equal(sent.effort, expectedEffort);
+          if (expectedEffort === undefined) assert.notProperty(requests[0], "effort");
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["model removed", "effort removed"] as const)(
+    "strict Codex selection rechecks the visible catalog after %s",
+    (change) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `native-selection-recheck-${change}`;
+        const firstTurnId = "selection-recheck-first";
+        const secondTurnId = "selection-recheck-second";
+        const complete = (turnId: string): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "emit_inbound",
+          label: "turn/completed",
+          frame: {
+            method: "turn/completed",
+            params: {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: turnId, status: "completed" }),
+            },
+          },
+        });
+        let models: ReadonlyArray<ServerProviderModel> = [
+          {
+            slug: CODEX_TEST_MODEL_SELECTION.model,
+            name: "Fixture model",
+            isCustom: false,
+            capabilities: {
+              optionDescriptors: [
+                {
+                  id: "reasoningEffort",
+                  label: "Reasoning effort",
+                  type: "select",
+                  options: [{ id: "high", label: "High" }],
+                },
+              ],
+            },
+          },
+        ];
+        let catalogReads = 0;
+        let turnStarts = 0;
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `selection-recheck-${change}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: firstTurnId,
+                prompt: "first",
+                effort: "high",
+              }),
+              complete(firstTurnId),
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: secondTurnId,
+                prompt: "second",
+                effort: "high",
+              })
+                .slice(5)
+                .map((entry) => withReplayRequestId(entry, 4)),
+              complete(secondTurnId),
+            ],
+          }),
+          undefined,
+          (method) =>
+            Effect.sync(() => {
+              if (method === "turn/start") turnStarts += 1;
+            }),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          Effect.sync(() => {
+            catalogReads += 1;
+            return models;
+          }),
+        );
+        const firstTurn = {
+          ...makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("selection-recheck-first"),
+            text: "first",
+          }),
+          modelSelection: {
+            ...CODEX_TEST_MODEL_SELECTION,
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
+          runtimePolicy: { ...CODEX_TEST_RUNTIME_POLICY, selectionPolicy: "strict" as const },
+        };
+        yield* harness.runtime.startTurn(firstTurn);
+        yield* harness.awaitTerminal(1);
+        models =
+          change === "model removed"
+            ? []
+            : models.map((model) => ({ ...model, capabilities: null }));
+        const result = yield* Effect.exit(
+          harness.runtime.startTurn({
+            ...firstTurn,
+            runId: RunId.make("selection-recheck-second"),
+            attemptId: RunAttemptId.make("selection-recheck-second"),
+            rootNodeId: NodeId.make("selection-recheck-second"),
+            runOrdinal: 2,
+            providerTurnOrdinal: 2,
+            message: {
+              ...firstTurn.message,
+              messageId: MessageId.make("selection-recheck-second"),
+              text: "second",
+            },
+          }),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.equal(turnStarts, 1, "only the first verified turn may send task input");
+        assert.equal(
+          catalogReads,
+          2,
+          "a prior valid selection cannot stand in for the current snapshot",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect("keeps native image views available to the clients", () =>
     Effect.gen(function* () {

@@ -33,6 +33,8 @@ Routine sorting within approved scope needs no repeated confirmation. New scope,
 
 Respect `dispatchPaused` when present. Prepare or Refine pauses new plan dispatch before requesting planning; confirming the plan does not resume it. Only the user can resume through Continue team when the plan is confirmed and this coordinator is idle. Pause does not cancel workers already running, prevent result inspection, or stop acceptance of their completed work. It does not create a sandbox for native provider tools or grant additional permissions. If paused, report what is waiting rather than trying another dispatch path.
 
+Read `dispatchLimits` when present. Only the user can configure these limits in Task plan. A concurrent task cap counts this plan's original employees, including historical revisions still running, queued, waiting or unverified. Wait for completion wakes when capacity is full; do not poll, drop the plan reference or use another launch tool to bypass it. The execution cap counts distinct employees across all revisions, including failed and cancelled attempts; a new revision does not refund that allowance. When exhausted, report the saved executions and the decision needed before more dispatch. Missing or null caps are unset, not an implicit allowance to ignore an agreed limit. These are plan dispatch limits, not monetary/token budgets or limits on coordinator turns, manual continuations or provider-native tools.
+
 ## 2. Discover and assign available executors
 
 Call `orchestrator_capabilities` before selecting executors. For this environment the input is:
@@ -56,6 +58,8 @@ If an approved seat or explicitly requested model is missing, unavailable, or de
 The generic resolver rejects an unadvertised explicit model with `model_unavailable` when its catalog is nonempty; an empty catalog accepts arbitrary slugs, which does not prove account access. Strict plan-linked ACP runs additionally verify the session-advertised model and explicit options before sending a prompt, including reported configuration values where exposed. An unconfirmed selection is rejected. Legacy `session/set_model` relies on a successful protocol acknowledgement, without independently observing the model used for inference. The backend does not enforce that a provider-reported execution model equals the requested model; the mismatch check above remains a coordinator rule in this preview.
 
 Discovery never authorizes installation, authentication, or reading credentials. Ask the user to complete the relevant setup when needed. Codex and Antigravity rely on their existing T3 adapters. Treat Qoder as unverified even if an ACP Registry instance appears available: protocol availability alone does not prove this workflow works.
+
+Plan-linked Codex turns additionally require a published model and supported explicit options in the current provider snapshot before `turn/start`. A user-configured custom entry does not prove availability. Refresh discovery after account or catalog changes; a refusal is not permission to substitute a model, drop an explicit option or abandon the plan reference. A configured selection still does not prove which underlying model performed inference.
 
 ## 3. Dispatch independent tasks through T3
 
@@ -109,7 +113,9 @@ Record acceptance as `pending`, `accepted`, `issues`, or `blocked` through the p
 
 ## 5. Report on a schedule only when requested
 
-Periodic reporting is opt-in. Agree on its cadence in the opening chat when the user requests it. Reuse `schedule_task`; do not start a shell loop, external scheduler, or webhook. Scheduled prompts can consume provider usage, so retain the approved budget. This example is for an explicitly requested hourly report in the coordinator thread:
+Periodic reporting is opt-in. Agree on its cadence in the opening chat when the user requests it. Task plan can save passive status snapshots through its user-owned report schedule. The existing server scheduler resumes its persisted due time after restart and coalesces missed periods into one current snapshot. These reports do not call a model, change acceptance, resume dispatch or send external notifications. Only the user can configure or stop this plan schedule. Read `reportSchedule` and `latestReport` as saved observations; do not create a duplicate prompt schedule merely because a passive snapshot is old or the app was offline.
+
+A separately requested coordinator-written report can use `schedule_task`. It starts a model turn with the coordinator's normal tools and permissions; a "report only" prompt is not a backend read-only boundary. Keep it within the approved usage allowance, preserve its saved ID and disclose that distinction. Do not start a shell loop, external scheduler or webhook. This example is for an explicitly requested hourly coordinator-written report in the conversation:
 
 ```json
 {

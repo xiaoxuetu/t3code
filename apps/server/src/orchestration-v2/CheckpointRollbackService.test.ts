@@ -203,7 +203,16 @@ it.effect.each([
     const openEntered = Deferred.makeUnsafe<void>();
     const calls: string[] = [];
     let cleanupEntered = false;
-    const providerThread = { id: providerThreadId, providerSessionId, providerInstanceId };
+    const providerThread = {
+      id: providerThreadId,
+      providerSessionId,
+      providerInstanceId,
+      nativeThreadRef: {
+        driver: ProviderDriverKind.make("acpRegistry"),
+        nativeId: "reused-native-session",
+      },
+      nativeMetadata: { itemIdentityVersion: 3, itemIdentityScope: "saved-rollback-scope" },
+    };
     const projection = {
       thread: {
         id: threadId,
@@ -302,6 +311,10 @@ it.effect.each([
             open: (input) =>
               Effect.gen(function* () {
                 assert.equal(input.runtimePolicy.cwd, worktreePath);
+                assert.equal(input.initialProviderThreadId, providerThreadId);
+                assert.equal(input.initialNativeThreadId, "reused-native-session");
+                assert.equal(input.initialProviderItemIdentityVersion, 3);
+                assert.equal(input.initialProviderItemIdentityScope, "saved-rollback-scope");
                 if (!(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie))) {
                   return yield* new ProviderWorkspaceMissingError({
                     threadId,

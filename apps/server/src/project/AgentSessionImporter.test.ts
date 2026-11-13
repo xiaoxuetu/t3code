@@ -494,6 +494,19 @@ it.effect(
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const source = candidate(CODEX_MODEL_SELECTION, "native-history");
       const threadId = yield* seedOwner(source);
+      const saved = (yield* projections.getThreadRecords(threadId, ["providerThreads"]))
+        .providerThreads[0];
+      if (saved === undefined) return yield* Effect.die("Missing synthetic provider thread");
+      yield* projections.apply({
+        id: EventId.make("native-history:scope"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          ...saved,
+          nativeMetadata: { itemIdentityVersion: 3, itemIdentityScope: "saved-import-scope" },
+        },
+      });
       const resolved: Array<ProviderInstanceId> = [];
       const opened: Array<ProviderAdapter.ProviderAdapterV2OpenSessionInput> = [];
       let closed = false;
@@ -575,6 +588,9 @@ it.effect(
       expect(opened[1]).toMatchObject({
         threadId,
         initialNativeThreadId: source.source.providerSessionId,
+        initialProviderThreadId: saved.id,
+        initialProviderItemIdentityVersion: 3,
+        initialProviderItemIdentityScope: "saved-import-scope",
         runtimePolicy: { cwd: "/workspace/project" },
       });
       // Forks keep run-less history only for this origin.

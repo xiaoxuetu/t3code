@@ -96,6 +96,11 @@ it("preserves actionable T3 errors wrapped by turn startup", () => {
       message: "The agent could not apply an explicitly requested configuration option.",
       cause: new Error("private provider rejection detail"),
     },
+    {
+      _tag: "CodexSelectionUnavailableError",
+      message: "The requested Codex model is not available in the current model catalog.",
+      cause: new Error("private provider rejection detail"),
+    },
     new ProviderSetupError({
       instanceId: ProviderInstanceId.make("codex"),
       operation: "runtime",

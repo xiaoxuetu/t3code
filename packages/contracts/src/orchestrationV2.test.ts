@@ -7,6 +7,7 @@ import {
   latestProviderTurnForAttempt,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
+  OrchestrationV2ProviderThreadNativeMetadata,
   OrchestrationV2ProviderThreadJson,
   OrchestrationV2RpcSchemas,
   OrchestrationV2Subagent,
@@ -33,6 +34,7 @@ const decodeOrchestrationV2ProviderThread = Schema.decodeUnknownSync(Orchestrati
 const decodeOrchestrationV2ProviderCapabilities = Schema.decodeUnknownSync(
   OrchestrationV2ProviderCapabilities,
 );
+const isProviderThreadNativeMetadata = Schema.is(OrchestrationV2ProviderThreadNativeMetadata);
 
 describe("orchestration V2 contracts", () => {
   it("decodes thread event types from a newer server as skippable items", () => {
@@ -444,6 +446,22 @@ describe("orchestration V2 contracts", () => {
     expect(runtimeThread.pendingBackgroundTasks).toEqual([]);
     expect(runtimeThread.contextUsage).toBeNull();
     expect(runtimeThread.nativeMetadata).toBeNull();
+    expect(isProviderThreadNativeMetadata({ itemIdentityVersion: 2 })).toBe(true);
+    const scopedMetadata = { itemIdentityVersion: 3 as const, itemIdentityScope: "saved-scope" };
+    expect(isProviderThreadNativeMetadata(scopedMetadata)).toBe(true);
+    const scopedThread = { ...runtimeThread, nativeMetadata: scopedMetadata };
+    expect(
+      decodeOrchestrationV2ProviderThreadJson(encodeOrchestrationV2ProviderThreadJson(scopedThread))
+        .nativeMetadata,
+    ).toEqual(scopedMetadata);
+    for (const metadata of [
+      { itemIdentityVersion: 3 },
+      { itemIdentityVersion: 3, itemIdentityScope: "" },
+      { itemIdentityVersion: 2, itemIdentityScope: "unexpected-scope" },
+      { itemIdentityScope: "unversioned-scope" },
+      { itemIdentityVersion: 4, itemIdentityScope: "unknown-version" },
+    ])
+      expect(isProviderThreadNativeMetadata(metadata)).toBe(false);
   });
 });
 

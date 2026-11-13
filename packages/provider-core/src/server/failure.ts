@@ -72,6 +72,8 @@ const CODEX_ACCESS_REQUIREMENT_REJECTION =
 const PROVIDER_FAILURE_REASONS: Record<ProviderAdapterFailureReason, string> = {
   previous_turn_active: "the previous turn is still running",
   attachment_unreadable: "an attachment could not be read",
+  invalid_item_identity: "the saved provider identity is invalid or incomplete",
+  session_owner_mismatch: "the provider session belongs to a different conversation",
 };
 
 /**
@@ -111,6 +113,7 @@ function curatedCauseMessages(cause: unknown): {
           };
         case "AcpModelSelectionError":
         case "AcpConfigurationSelectionError":
+        case "CodexSelectionUnavailableError":
         case "ClaudeBackgroundWorkBlocksQueryReplacementError":
         case "ClaudeAppendSystemPromptFileError":
         case "ClaudeAppendSystemPromptMissingValueError":

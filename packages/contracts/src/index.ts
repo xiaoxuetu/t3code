@@ -75,3 +75,4 @@ export * from "./settingsSecretValue.ts";
 export * from "./clientRpcPermissions.ts";
 
 export * from "./teamPlan.ts";
+export * from "./teamPlanReport.ts";

@@ -310,7 +310,7 @@ export const McpToolUseCase = Schema.Struct({
       Schema.Struct({
         phase: Schema.Literals(["prepare", "continue"]),
         goal: Schema.String,
-        planVersion: Schema.optional(Schema.Number),
+        planVersion: Schema.optionalKey(Schema.Number),
       }),
     ),
     /** Runs only on this harness, for cases whose right answer depends on it. */

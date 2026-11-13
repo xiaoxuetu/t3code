@@ -21,6 +21,7 @@ import {
   CheckpointId,
   EnvironmentId,
   type ModelSelection,
+  NodeId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -572,6 +573,16 @@ function makeMockRuntime(input: {
 }
 
 const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
+const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
+
+function acpItemIdentityScope(providerThread: OrchestrationV2ProviderThread) {
+  const identityScope = providerThread.nativeMetadata?.itemIdentityScope;
+  assert.equal(providerThread.nativeMetadata?.itemIdentityVersion, 3);
+  if (typeof identityScope !== "string" || identityScope.trim().length === 0) {
+    throw new Error("Expected a persisted v3 ACP item identity scope");
+  }
+  return { identityScope };
+}
 
 const makePromptInactivityHarness = Effect.fnUntraced(function* (input: {
   readonly environment: (runtimeOrdinal: number) => Readonly<Record<string, string>>;
@@ -1457,6 +1468,7 @@ describe("AcpAdapterV2", () => {
       yield* Deferred.await(wireSettled);
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       yield* runtime.interruptTurn({ providerThread, providerTurnId });
@@ -1571,6 +1583,7 @@ describe("AcpAdapterV2", () => {
       yield* Deferred.await(dispatched);
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       // Force stop finalizes the turn without waiting for the gated prompt response.
@@ -3655,6 +3668,7 @@ describe("AcpAdapterV2", () => {
         ];
       };
       const instanceId = ProviderInstanceId.make("devin-streamed-write");
+      const childSessionId = "child-a";
       const adapter = yield* makeAcpAdapterV2({
         instanceId,
         selfInvocation: yield* resolveSelfInvocation(),
@@ -3754,12 +3768,29 @@ describe("AcpAdapterV2", () => {
           now: yield* DateTime.now,
         }),
       );
-      const items = Array.from(
+      const events = Array.from(
         yield* runtime.events.pipe(
           Stream.takeUntil((event) => event.type === "turn.terminal"),
           Stream.runCollect,
         ),
-      ).flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
+      );
+      const childProviderThread = events
+        .flatMap((event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.nativeThreadRef?.nativeId === childSessionId
+            ? [event.providerThread]
+            : [],
+        )
+        .at(-1);
+      assert.isDefined(childProviderThread);
+      assert.equal(childProviderThread?.nativeMetadata?.itemIdentityVersion, 3);
+      assert.equal(
+        childProviderThread?.nativeMetadata?.itemIdentityScope,
+        providerThread.nativeMetadata?.itemIdentityScope,
+      );
+      const items = events.flatMap((event) =>
+        event.type === "turn_item.updated" ? [event.turnItem] : [],
+      );
       for (const toolCallId of ["root-write", "child-write"]) {
         const writes = items.filter((item) => item.nativeItemRef?.nativeId?.endsWith(toolCallId));
         assert.isAtLeast(writes.length, chunks / 10, toolCallId);
@@ -4652,6 +4683,56 @@ describe("AcpAdapterV2", () => {
         afterOmittedPatch.messages.some((message) => message.text === "late authoritative text"),
         "omitted late message content must preserve the authoritative text",
       );
+      yield* sessionUpdateHandler!({
+        sessionId: "unknown-native-session",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "unknown-history",
+          content: { type: "text", text: "unknown native session leak" },
+        },
+      });
+      yield* sessionUpdateHandler!({
+        sessionId: "unknown-native-session",
+        update: {
+          sessionUpdate: "session_info_update",
+          title: "Unknown native session title",
+          updatedAt: "2026-08-23T00:00:00Z",
+        },
+      });
+      yield* sessionUpdateHandler!({
+        sessionId: "mock-session-1",
+        update: { sessionUpdate: "session_info_update", title: "Known session marker" },
+      });
+      const lateEvents = Array.from(
+        yield* runtime.events.pipe(
+          Stream.takeUntil(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.providerThread.nativeMetadata?.title === "Known session marker",
+          ),
+          Stream.runCollect,
+        ),
+      );
+      assert.notInclude(JSON.stringify(lateEvents), "unknown native session leak");
+      assert.notInclude(JSON.stringify(lateEvents), "Unknown native session title");
+      assert.notInclude(JSON.stringify(lateEvents), "unknown-native-session");
+      const marker = lateEvents.at(-1);
+      assert.equal(marker?.type, "provider_thread.updated");
+      if (marker?.type === "provider_thread.updated") {
+        assert.equal(marker.providerThread.id, providerThread.id);
+        assert.equal(marker.providerThread.appThreadId, threadId);
+        assert.equal(marker.providerThread.nativeThreadRef?.nativeId, "mock-session-1");
+        assert.deepEqual(
+          acpItemIdentityScope(marker.providerThread),
+          acpItemIdentityScope(providerThread),
+        );
+      }
+      const afterUnknownSession = yield* runtime.readThreadSnapshot({ providerThread });
+      assert.deepEqual(afterUnknownSession.messages, afterOmittedPatch.messages);
+      assert.notInclude(
+        JSON.stringify(afterUnknownSession.providerThread.nativeMetadata),
+        "Unknown native session title",
+      );
     }).pipe(Effect.provide(layerTest)),
   );
 
@@ -4716,9 +4797,259 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.live(
-    "loads the persisted ACP session during startup without creating a throwaway session",
-    () =>
+  it.live("isolates independent ACP employees with overlapping native identities", () =>
+    Effect.gen(function* () {
+      type Event = ProviderAdapter.ProviderAdapterV2Event;
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const mockAgentPath = yield* bundledMockAgentPath;
+      const instanceId = ProviderInstanceId.make("acp-independent-employees");
+      const protocols = yield* Effect.all(
+        Array.from({ length: 3 }, () => Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>()),
+      );
+      const nativePermissionIds: Array<Array<unknown>> = [[], [], []];
+      const nativeToolCallIds: Array<Array<string>> = [[], [], []];
+      const coordinatorId = ThreadId.make("thread-acp-independent-coordinator");
+      let runtimeOrdinal = 0;
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: (input) => {
+            const ordinal = runtimeOrdinal++;
+            return makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              protocolEvents: protocols[ordinal]!,
+              environment: { T3_ACP_EMIT_TOOL_CALLS: "1" },
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleRequestPermission: (handler) =>
+                  runtime.handleRequestPermission((params, context) =>
+                    Effect.sync(() => {
+                      nativePermissionIds[ordinal]!.push(context.requestId);
+                      nativeToolCallIds[ordinal]!.push(params.toolCall.toolCallId);
+                    }).pipe(Effect.andThen(handler(params, context))),
+                  ),
+              }),
+            })(input);
+          },
+        },
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const open = (name: string, initial?: OrchestrationV2ProviderThread) =>
+        Effect.gen(function* () {
+          const scope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+            Scope.close(scope, Exit.void),
+          );
+          const threadId = ThreadId.make(`thread-acp-independent-${name}`);
+          const runtime = yield* adapter
+            .openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make(`session-acp-independent-${name}`),
+              modelSelection,
+              runtimePolicy,
+              ...(initial?.nativeThreadRef?.nativeId == null
+                ? {}
+                : {
+                    initialProviderThreadId: initial.id,
+                    initialNativeThreadId: initial.nativeThreadRef.nativeId,
+                    ...(initial.nativeMetadata?.itemIdentityScope === undefined
+                      ? {}
+                      : {
+                          initialProviderItemIdentityScope:
+                            initial.nativeMetadata.itemIdentityScope,
+                        }),
+                    ...(initial.nativeMetadata?.itemIdentityVersion === undefined
+                      ? {}
+                      : {
+                          initialProviderItemIdentityVersion:
+                            initial.nativeMetadata.itemIdentityVersion,
+                        }),
+                  }),
+            })
+            .pipe(Effect.provideService(Scope.Scope, scope));
+          const providerThread = yield* initial === undefined
+            ? runtime.ensureThread({ threadId, modelSelection, runtimePolicy })
+            : runtime.resumeThread({ providerThread: initial, modelSelection, runtimePolicy });
+          const events: Array<Event> = [];
+          const queue = yield* Queue.unbounded<Event>();
+          yield* runtime.events.pipe(
+            Stream.runForEach((event) =>
+              Effect.sync(() => events.push(event)).pipe(Effect.andThen(Queue.offer(queue, event))),
+            ),
+            Effect.forkIn(scope),
+          );
+          const next = (predicate: (event: Event) => boolean) =>
+            Stream.fromQueue(queue).pipe(
+              Stream.filter(predicate),
+              Stream.runHead,
+              Effect.map(Option.getOrThrow),
+            );
+          return {
+            scope,
+            threadId,
+            runtime,
+            providerThread,
+            events,
+            next,
+            start: (ordinal: number) =>
+              DateTime.now.pipe(
+                Effect.flatMap((now) => {
+                  const turn = makeTurnInput({
+                    threadId,
+                    providerThread,
+                    instanceId,
+                    runtimePolicy,
+                    now,
+                    ordinal,
+                  });
+                  return runtime.startTurn({
+                    ...turn,
+                    appThread: {
+                      ...turn.appThread,
+                      lineage: {
+                        parentThreadId: coordinatorId,
+                        relationshipToParent: "subagent",
+                        rootThreadId: coordinatorId,
+                      },
+                      forkedFrom: { type: "node", nodeId: NodeId.make(`employee:${name}`) },
+                    },
+                  });
+                }),
+              ),
+            pending: () =>
+              next(
+                (event) =>
+                  event.type === "runtime_request.updated" &&
+                  event.runtimeRequest.status === "pending",
+              ).pipe(
+                Effect.map((event) => {
+                  if (event.type !== "runtime_request.updated")
+                    throw new Error("Expected approval");
+                  return event.runtimeRequest;
+                }),
+              ),
+            terminal: () =>
+              next((event) => event.type === "turn.terminal").pipe(
+                Effect.map((event) => {
+                  if (event.type !== "turn.terminal") throw new Error("Expected turn terminal");
+                  return event;
+                }),
+              ),
+          };
+        });
+      const a = yield* open("a");
+      const b = yield* open("b");
+      assert.equal(a.providerThread.nativeThreadRef?.nativeId, "mock-session-1");
+      assert.equal(b.providerThread.nativeThreadRef?.nativeId, "mock-session-1");
+      assert.equal(a.providerThread.nativeMetadata?.itemIdentityVersion, 3);
+      assert.equal(b.providerThread.nativeMetadata?.itemIdentityVersion, 3);
+      assert.isString(a.providerThread.nativeMetadata?.itemIdentityScope);
+      assert.isString(b.providerThread.nativeMetadata?.itemIdentityScope);
+      assert.notEqual(
+        a.providerThread.nativeMetadata?.itemIdentityScope,
+        b.providerThread.nativeMetadata?.itemIdentityScope,
+      );
+      yield* Effect.all([a.start(1), b.start(1)], { concurrency: "unbounded" });
+      const [a1, b1] = yield* Effect.all([a.pending(), b.pending()]);
+      yield* a.runtime.respondToRuntimeRequest({ requestId: a1.id, decision: "accept" });
+      assert.equal((yield* a.terminal()).status, "completed");
+      const assertOwnedMessages = (events: ReadonlyArray<Event>, threadId: ThreadId) => {
+        const messages = events.filter((event) => event.type === "message.updated");
+        assert.isNotEmpty(messages);
+        assert.isTrue(messages.every((event) => event.message.threadId === threadId));
+      };
+      assertOwnedMessages(a.events, a.threadId);
+      const remainsPending = () => {
+        const requests = b.events.filter((event) => event.type === "runtime_request.updated");
+        assert.equal(requests.at(-1)?.runtimeRequest.status, "pending");
+        assert.isFalse(b.events.some((event) => event.type === "message.updated"));
+        assert.isFalse(b.events.some((event) => event.type === "turn.terminal"));
+      };
+      remainsPending();
+      yield* a.start(2);
+      const a2 = yield* a.pending();
+      if (a2.providerTurnId === null) return yield* Effect.die("Expected an active approval turn");
+      yield* a.runtime.interruptTurn({
+        providerThread: a.providerThread,
+        providerTurnId: a2.providerTurnId,
+      });
+      assert.equal((yield* a.terminal()).status, "interrupted");
+      remainsPending();
+      const bProtocol = Array.from(yield* Queue.takeAll(protocols[1]!));
+      assert.notInclude(bProtocol.map(rawProtocolMethod), "session/cancel");
+      yield* b.runtime.respondToRuntimeRequest({ requestId: b1.id, decision: "accept" });
+      assert.equal((yield* b.terminal()).status, "completed");
+      assertOwnedMessages(b.events, b.threadId);
+      yield* b.start(2);
+      const b2 = yield* b.pending();
+      yield* Scope.close(b.scope, Exit.void);
+      const restored = yield* open("b", b.providerThread);
+      assert.equal(restored.providerThread.id, b.providerThread.id);
+      assert.equal(restored.providerThread.nativeThreadRef?.nativeId, "mock-session-1");
+      assert.deepEqual(restored.providerThread.nativeMetadata, b.providerThread.nativeMetadata);
+      const resumedProtocol = Array.from(yield* Queue.takeAll(protocols[2]!));
+      assert.include(resumedProtocol.map(rawProtocolMethod), "session/resume");
+      assert.notInclude(resumedProtocol.map(rawProtocolMethod), "session/new");
+      const staleResponse = yield* Effect.exit(
+        restored.runtime.respondToRuntimeRequest({ requestId: b2.id, decision: "accept" }),
+      );
+      assert.isTrue(Exit.isFailure(staleResponse));
+      if (Exit.isFailure(staleResponse))
+        assert.include(Cause.pretty(staleResponse.cause), "No pending ACP runtime request");
+      yield* restored.start(3);
+      const restoredApproval = yield* restored.pending();
+      assert.equal(
+        restoredApproval.providerTurnId,
+        (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(b.providerThread),
+          nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:3"),
+        }),
+      );
+      yield* restored.runtime.respondToRuntimeRequest({
+        requestId: restoredApproval.id,
+        decision: "accept",
+      });
+      assert.equal((yield* restored.terminal()).status, "completed");
+      assertOwnedMessages(restored.events, restored.threadId);
+      assert.equal(runtimeOrdinal, 3);
+      assert.isDefined(nativePermissionIds[0]?.[0]);
+      assert.equal(nativePermissionIds[0]?.[0], nativePermissionIds[1]?.[0]);
+      assert.equal(nativeToolCallIds[0]?.[0], "tool-call-1");
+      assert.equal(nativeToolCallIds[1]?.[0], "tool-call-1");
+      assert.equal(nativeToolCallIds[2]?.[0], "tool-call-1");
+      const turnIds = (events: ReadonlyArray<Event>) =>
+        new Set(
+          events.flatMap((event) =>
+            event.type === "provider_turn.updated" ? [event.providerTurn.id] : [],
+          ),
+        );
+      const messageIds = (events: ReadonlyArray<Event>) =>
+        new Set(
+          events.flatMap((event) => (event.type === "message.updated" ? [event.message.id] : [])),
+        );
+      assert.deepEqual(
+        {
+          providerThreadCollision: a.providerThread.id === b.providerThread.id,
+          providerTurnCollisions: [...turnIds(a.events)].filter((id) => turnIds(b.events).has(id)),
+          messageCollisions: [...messageIds(a.events)].filter((id) => messageIds(b.events).has(id)),
+        },
+        { providerThreadCollision: false, providerTurnCollisions: [], messageCollisions: [] },
+      );
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.each([undefined, 2] as const)(
+    "loads persisted ACP identity version %s without changing historical IDs",
+    (itemIdentityVersion) =>
       Effect.gen(function* () {
         const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -4746,12 +5077,21 @@ describe("AcpAdapterV2", () => {
           cwd: process.cwd(),
         });
         const modelSelection = { instanceId, model: "default" } as const;
+        const persistedProviderThreadId = idAllocator.derive.providerThread({
+          driver: ACP_TEST_DRIVER,
+          providerInstanceId: instanceId,
+          nativeThreadId: "persisted-session",
+        });
         const runtime = yield* adapter.openSession({
           threadId,
           providerSessionId: ProviderSessionId.make("provider-session-acp-eager-resume"),
           modelSelection,
           runtimePolicy,
+          initialProviderThreadId: persistedProviderThreadId,
           initialNativeThreadId: "persisted-session",
+          ...(itemIdentityVersion === undefined
+            ? {}
+            : { initialProviderItemIdentityVersion: itemIdentityVersion }),
         });
         const providerThread = yield* runtime.ensureThread({
           threadId,
@@ -4760,13 +5100,32 @@ describe("AcpAdapterV2", () => {
         });
 
         assert.equal(providerThread.nativeThreadRef?.nativeId, "persisted-session");
-        assert.isNull(providerThread.nativeMetadata);
+        assert.equal(providerThread.id, persistedProviderThreadId);
+        assert.deepEqual(
+          providerThread.nativeMetadata,
+          itemIdentityVersion === undefined ? null : { itemIdentityVersion },
+        );
         const startupMethods = yield* pollProtocolMethods(protocolEvents);
         assert.include(startupMethods, "session/resume");
         assert.notInclude(startupMethods, "session/new");
 
         yield* runtime.resumeThread({ providerThread, modelSelection, runtimePolicy });
         assert.notInclude(yield* pollProtocolMethods(protocolEvents), "session/resume");
+        const replay = yield* runtime.readThreadSnapshot({ providerThread });
+        const replayMessage = replay.messages.find((message) => message.text === "replay");
+        assert.equal(
+          replayMessage?.id,
+          idAllocator.derive.messageFromProviderItem({
+            driver: ACP_TEST_DRIVER,
+            nativeItemId:
+              itemIdentityVersion === undefined
+                ? "persisted-session:history:user:message:mock-user-message"
+                : acpScopedNativeId(
+                    instanceId,
+                    "persisted-session:history:user:message:mock-user-message",
+                  ),
+          }),
+        );
         const now = yield* DateTime.now;
         yield* runtime.startTurn(
           makeTurnInput({
@@ -4788,126 +5147,106 @@ describe("AcpAdapterV2", () => {
           terminal?.providerTurnId,
           idAllocator.derive.providerTurn({
             driver: ACP_TEST_DRIVER,
-            nativeTurnId: "persisted-session:turn:1",
+            nativeTurnId:
+              itemIdentityVersion === undefined
+                ? "persisted-session:turn:1"
+                : acpScopedNativeId(instanceId, "persisted-session:turn:1"),
           }),
         );
       }).pipe(Effect.provide(layerTest)),
   );
 
-  it.live("creates a fresh ACP identity when recovering an exhausted target", () =>
+  it.effect.each([
+    { label: "missing v3 scope", version: 3, scope: undefined, nativeId: "persisted-session" },
+    { label: "empty v3 scope", version: 3, scope: "", nativeId: "persisted-session" },
+    { label: "blank v3 scope", version: 3, scope: " \t ", nativeId: "persisted-session" },
+    {
+      label: "v2 with scope",
+      version: 2,
+      scope: "unexpected-scope",
+      nativeId: "persisted-session",
+    },
+    {
+      label: "unversioned scope",
+      version: undefined,
+      scope: "unexpected-scope",
+      nativeId: "persisted-session",
+    },
+    {
+      label: "unknown identity version",
+      version: 4,
+      scope: "unexpected-scope",
+      nativeId: "persisted-session",
+    },
+    {
+      label: "v3 scope without a raw session ID",
+      version: 3,
+      scope: "persisted-scope",
+      nativeId: undefined,
+    },
+  ])("rejects $label before starting an ACP runtime", ({ version, scope, nativeId }) =>
     Effect.gen(function* () {
-      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const selfInvocation = yield* resolveSelfInvocation();
-      const mockAgentPath = yield* bundledMockAgentPath;
-      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
-      const instanceId = ProviderInstanceId.make("acp-test-exhausted-target");
+      let runtimeStarts = 0;
+      const instanceId = ProviderInstanceId.make("acp-invalid-persisted-identity");
       const adapter = yield* makeAcpAdapterV2({
         instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
         flavor: {
           driver: ACP_TEST_DRIVER,
           capabilities: AcpProviderCapabilitiesV2,
-          makeRuntime: makeMockRuntime({
-            childProcessSpawner,
-            mockAgentPath,
-            protocolEvents,
-            wrapRuntime: (runtime, ordinal) => ({
-              ...runtime,
-              start: () =>
-                runtime.start().pipe(
-                  Effect.map((started) => ({
-                    ...started,
-                    sessionId: `mock-recovery-session-${ordinal}`,
-                  })),
-                ),
+          makeRuntime: () =>
+            Effect.suspend(() => {
+              runtimeStarts += 1;
+              return Effect.die("Invalid persisted ACP identity reached runtime startup");
             }),
-          }),
         },
-        selfInvocation,
       });
-      const threadId = ThreadId.make("thread-acp-exhausted-target");
-      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-        runtimeMode: "full-access",
-        interactionMode: "default",
-        cwd: process.cwd(),
-      });
-      const modelSelection = { instanceId, model: "default" } as const;
-      const runtime = yield* adapter.openSession({
-        threadId,
-        providerSessionId: ProviderSessionId.make("provider-session-acp-exhausted-target"),
-        modelSelection,
-        runtimePolicy,
-      });
-      const original = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
-      yield* runtime.startTurn(
-        makeTurnInput({
-          threadId,
-          providerThread: original,
-          instanceId,
-          runtimePolicy,
-          now: yield* DateTime.now,
-          ordinal: 1,
-        }),
-      );
-      yield* runtime.events.pipe(
-        Stream.takeUntil((event) => event.type === "turn.terminal"),
-        Stream.runDrain,
-      );
-      const replacement = yield* runtime.ensureThread({
-        threadId,
-        modelSelection,
-        runtimePolicy,
-        existingProviderThread: { ...original, nativeThreadRef: null },
-        forceNewNativeThread: true,
-      });
-      assert.notEqual(replacement.nativeThreadRef?.nativeId, original.nativeThreadRef?.nativeId);
-      assert.equal(replacement.id, original.id);
-      assert.equal(replacement.nativeMetadata?.itemIdentityVersion, 2);
-      yield* runtime.startTurn(
-        makeTurnInput({
-          threadId,
-          providerThread: replacement,
-          instanceId,
-          runtimePolicy,
-          now: yield* DateTime.now,
-          ordinal: 2,
-        }),
-      );
-      const events = yield* runtime.events.pipe(
-        Stream.takeUntil((event) => event.type === "turn.terminal"),
-        Stream.runCollect,
-      );
-      assert.isTrue(
-        events.some((event) => event.type === "turn.terminal" && event.status === "completed"),
-      );
-      const methods = yield* pollProtocolMethods(protocolEvents);
-      assert.equal(methods.filter((method) => method === "session/new").length, 2);
+      const result = yield* adapter
+        .openSession({
+          threadId: ThreadId.make("thread-acp-invalid-persisted-identity"),
+          providerSessionId: ProviderSessionId.make("session-acp-invalid-persisted-identity"),
+          modelSelection: { instanceId, model: "default" },
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          }),
+          ...(nativeId === undefined ? {} : { initialNativeThreadId: nativeId }),
+          ...(version === undefined
+            ? {}
+            : { initialProviderItemIdentityVersion: version as 2 | 3 }),
+          ...(scope === undefined ? {} : { initialProviderItemIdentityScope: scope }),
+        })
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.isTrue(isProviderAdapterProtocolError(result.failure.cause));
+        if (isProviderAdapterProtocolError(result.failure.cause))
+          assert.equal(result.failure.cause.reason, "invalid_item_identity");
+      }
+      assert.equal(runtimeStarts, 0);
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.live("preserves new-session fallback when an eager ACP session load is stale", () =>
+  it.live("rejects incomplete v3 thread identities without changing the active ACP scope", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const idAllocator = yield* IdAllocator.IdAllocatorV2;
-      const selfInvocation = yield* resolveSelfInvocation();
-      const mockAgentPath = yield* bundledMockAgentPath;
       const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
-      const instanceId = ProviderInstanceId.make("acp-test-stale-eager-resume");
+      const instanceId = ProviderInstanceId.make("acp-invalid-thread-identity");
       const adapter = yield* makeAcpAdapterV2({
         instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
         flavor: {
           driver: ACP_TEST_DRIVER,
           capabilities: AcpProviderCapabilitiesV2,
           makeRuntime: makeMockRuntime({
             childProcessSpawner,
-            mockAgentPath,
+            mockAgentPath: yield* bundledMockAgentPath,
             protocolEvents,
-            environment: (runtimeOrdinal) =>
-              runtimeOrdinal === 1 ? { T3_ACP_FAIL_LOAD_SESSION: "1" } : {},
           }),
         },
-        selfInvocation,
       });
-      const threadId = ThreadId.make("thread-acp-stale-eager-resume");
+      const threadId = ThreadId.make("thread-acp-invalid-thread-identity");
       const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
         runtimeMode: "full-access",
         interactionMode: "default",
@@ -4916,70 +5255,505 @@ describe("AcpAdapterV2", () => {
       const modelSelection = { instanceId, model: "default" } as const;
       const runtime = yield* adapter.openSession({
         threadId,
-        providerSessionId: ProviderSessionId.make("provider-session-acp-stale-eager-resume"),
+        providerSessionId: ProviderSessionId.make("session-acp-invalid-thread-identity"),
         modelSelection,
         runtimePolicy,
-        initialNativeThreadId: "stale-session",
       });
-      const replacementThread = yield* runtime.ensureThread({
+      const providerThread = yield* runtime.ensureThread({
         threadId,
         modelSelection,
         runtimePolicy,
       });
-      const staleThread: OrchestrationV2ProviderThread = {
-        ...replacementThread,
-        nativeMetadata: null,
-        nativeThreadRef: {
-          driver: ACP_TEST_DRIVER,
-          nativeId: "stale-session",
-          strength: "strong",
-        },
-      };
-
-      const startupMethods = yield* pollProtocolMethods(protocolEvents);
-      assert.equal(startupMethods.filter((method) => method === "session/resume").length, 1);
-      assert.equal(startupMethods.filter((method) => method === "session/new").length, 1);
-
-      const resumeError = yield* runtime
-        .resumeThread({ providerThread: staleThread, modelSelection, runtimePolicy })
-        .pipe(Effect.flip);
-      assert.equal(resumeError._tag, "ProviderAdapterResumeThreadError");
-      assert.notInclude(yield* pollProtocolMethods(protocolEvents), "session/resume");
-      assert.notEqual(replacementThread.nativeThreadRef?.nativeId, "stale-session");
-      const preservedReplacement = yield* runtime.ensureThread({
-        threadId,
-        modelSelection,
-        runtimePolicy,
-      });
-      assert.equal(preservedReplacement.nativeMetadata?.itemIdentityVersion, 2);
+      yield* Queue.takeAll(protocolEvents);
       const now = yield* DateTime.now;
+      for (const scope of [undefined, "", " \t "]) {
+        const invalidThread: OrchestrationV2ProviderThread = {
+          ...providerThread,
+          nativeMetadata: {
+            itemIdentityVersion: 3,
+            ...(scope === undefined ? {} : { itemIdentityScope: scope }),
+          },
+        };
+        const operations = [
+          runtime
+            .resumeThread({ providerThread: invalidThread, modelSelection, runtimePolicy })
+            .pipe(Effect.asVoid),
+          runtime
+            .startTurn(
+              makeTurnInput({
+                threadId,
+                providerThread: invalidThread,
+                instanceId,
+                runtimePolicy,
+                now,
+              }),
+            )
+            .pipe(Effect.asVoid),
+          runtime.readThreadSnapshot({ providerThread: invalidThread }).pipe(Effect.asVoid),
+        ];
+        for (const operation of operations) {
+          const result = yield* operation.pipe(Effect.result);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            assert.isTrue(isProviderAdapterProtocolError(result.failure.cause));
+            if (isProviderAdapterProtocolError(result.failure.cause))
+              assert.equal(result.failure.cause.reason, "invalid_item_identity");
+          }
+        }
+      }
+      const rejectedMethods = yield* pollProtocolMethods(protocolEvents);
+      assert.notInclude(rejectedMethods, "session/prompt");
+      assert.notInclude(rejectedMethods, "session/resume");
+      assert.notInclude(rejectedMethods, "session/new");
+      const preserved = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+      assert.deepEqual(preserved.nativeMetadata, providerThread.nativeMetadata);
       yield* runtime.startTurn(
-        makeTurnInput({
-          threadId,
-          providerThread: preservedReplacement,
-          instanceId,
-          runtimePolicy,
-          now,
-          ordinal: 1,
-        }),
+        makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now }),
       );
-      const terminal = Array.from(
+      const terminal = Option.getOrThrow(
         yield* runtime.events.pipe(
-          Stream.takeUntil((event) => event.type === "turn.terminal"),
-          Stream.runCollect,
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
         ),
-      ).find((event) => event.type === "turn.terminal");
+      );
+      assert.equal(terminal.status, "completed");
       assert.equal(
-        terminal?.providerTurnId,
-        idAllocator.derive.providerTurn({
+        terminal.providerTurnId,
+        (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
           driver: ACP_TEST_DRIVER,
-          nativeTurnId: acpScopedNativeId(
-            instanceId,
-            `${preservedReplacement.nativeThreadRef?.nativeId}:turn:1`,
-          ),
+          ...acpItemIdentityScope(providerThread),
+          nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         }),
       );
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.each([false, true])(
+    "creates a fresh ACP identity when recovering an exhausted target (raw ID reused: %s)",
+    (reuseNativeId) =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+        const instanceId = ProviderInstanceId.make("acp-test-exhausted-target");
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        type RuntimeCallbacks = {
+          permission?: Parameters<RuntimeService["handleRequestPermission"]>[0];
+          create?: Parameters<RuntimeService["handleCreateTerminal"]>[0];
+          output?: Parameters<RuntimeService["handleTerminalOutput"]>[0];
+          wait?: Parameters<RuntimeService["handleTerminalWaitForExit"]>[0];
+          kill?: Parameters<RuntimeService["handleTerminalKill"]>[0];
+          release?: Parameters<RuntimeService["handleTerminalRelease"]>[0];
+        };
+        const callbacksByRuntime = new Map<number, RuntimeCallbacks>();
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              protocolEvents,
+              wrapRuntime: (runtime, ordinal) => {
+                const callbacks: RuntimeCallbacks = {};
+                callbacksByRuntime.set(ordinal, callbacks);
+                return {
+                  ...runtime,
+                  start: () =>
+                    runtime.start().pipe(
+                      Effect.map((started) => ({
+                        ...started,
+                        sessionId: reuseNativeId
+                          ? started.sessionId
+                          : `mock-recovery-session-${ordinal}`,
+                      })),
+                    ),
+                  handleRequestPermission: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.permission = handler;
+                    }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
+                  handleCreateTerminal: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.create = handler;
+                    }).pipe(Effect.andThen(runtime.handleCreateTerminal(handler))),
+                  handleTerminalOutput: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.output = handler;
+                    }).pipe(Effect.andThen(runtime.handleTerminalOutput(handler))),
+                  handleTerminalWaitForExit: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.wait = handler;
+                    }).pipe(Effect.andThen(runtime.handleTerminalWaitForExit(handler))),
+                  handleTerminalKill: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.kill = handler;
+                    }).pipe(Effect.andThen(runtime.handleTerminalKill(handler))),
+                  handleTerminalRelease: (handler) =>
+                    Effect.sync(() => {
+                      callbacks.release = handler;
+                    }).pipe(Effect.andThen(runtime.handleTerminalRelease(handler))),
+                };
+              },
+            }),
+          },
+          selfInvocation,
+          clientTerminals: {},
+        });
+        const threadId = ThreadId.make("thread-acp-exhausted-target");
+        const foreignThreadId = ThreadId.make("thread-acp-exhausted-target-foreign-owner");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const initialProviderThreadId = (yield* IdAllocator.IdAllocatorV2).derive.providerThread({
+          driver: ACP_TEST_DRIVER,
+          providerInstanceId: instanceId,
+          nativeThreadId: "persisted-placeholder",
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-exhausted-target"),
+          initialProviderThreadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const foreignEnsure = yield* runtime
+          .ensureThread({ threadId: foreignThreadId, modelSelection, runtimePolicy })
+          .pipe(Effect.result);
+        assert.equal(foreignEnsure._tag, "Failure");
+        if (foreignEnsure._tag === "Failure")
+          assert.isTrue(isProviderAdapterProtocolError(foreignEnsure.failure.cause));
+        const original = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+        assert.equal(original.id, initialProviderThreadId);
+        assert.equal(original.appThreadId, threadId);
+        const oldCallbacks = callbacksByRuntime.get(1);
+        const originalRaw = original.nativeThreadRef?.nativeId;
+        if (
+          oldCallbacks?.create === undefined ||
+          oldCallbacks.output === undefined ||
+          oldCallbacks.wait === undefined ||
+          oldCallbacks.kill === undefined ||
+          oldCallbacks.release === undefined ||
+          oldCallbacks.permission === undefined ||
+          originalRaw == null
+        ) {
+          return yield* Effect.die("Expected original ACP terminal and permission callbacks");
+        }
+        const oldTerminal = yield* oldCallbacks.create(
+          {
+            sessionId: originalRaw,
+            command: process.execPath,
+            args: ["-e", "process.stdout.write('original terminal')"],
+          },
+          { requestId: "original-terminal-create", method: "terminal/create" },
+        );
+        yield* oldCallbacks.wait(
+          { sessionId: originalRaw, terminalId: oldTerminal.terminalId },
+          { requestId: "original-terminal-wait", method: "terminal/wait_for_exit" },
+        );
+        const oldOutput = yield* oldCallbacks.output(
+          { sessionId: originalRaw, terminalId: oldTerminal.terminalId },
+          { requestId: "original-terminal-output", method: "terminal/output" },
+        );
+        assert.equal(oldOutput.output, "original terminal");
+        yield* runtime.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread: original,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            ordinal: 1,
+          }),
+        );
+        yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+        const mismatchedExisting = yield* runtime
+          .ensureThread({
+            threadId,
+            modelSelection,
+            runtimePolicy,
+            existingProviderThread: { ...original, appThreadId: foreignThreadId },
+            forceNewNativeThread: true,
+          })
+          .pipe(Effect.result);
+        assert.equal(mismatchedExisting._tag, "Failure");
+        if (mismatchedExisting._tag === "Failure")
+          assert.isTrue(isProviderAdapterProtocolError(mismatchedExisting.failure.cause));
+        const preservedOriginal = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(preservedOriginal.id, original.id);
+        assert.equal(preservedOriginal.appThreadId, threadId);
+        assert.deepEqual(preservedOriginal.nativeMetadata, original.nativeMetadata);
+        const replacement = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+          existingProviderThread: { ...original, nativeThreadRef: null },
+          forceNewNativeThread: true,
+        });
+        if (reuseNativeId)
+          assert.equal(replacement.nativeThreadRef?.nativeId, original.nativeThreadRef?.nativeId);
+        else
+          assert.notEqual(
+            replacement.nativeThreadRef?.nativeId,
+            original.nativeThreadRef?.nativeId,
+          );
+        assert.equal(replacement.id, original.id);
+        assert.equal(replacement.nativeMetadata?.itemIdentityVersion, 3);
+        assert.isString(replacement.nativeMetadata?.itemIdentityScope);
+        assert.notEqual(
+          replacement.nativeMetadata?.itemIdentityScope,
+          original.nativeMetadata?.itemIdentityScope,
+        );
+        const newCallbacks = callbacksByRuntime.get(2);
+        const replacementRaw = replacement.nativeThreadRef?.nativeId;
+        if (
+          newCallbacks?.create === undefined ||
+          newCallbacks.output === undefined ||
+          newCallbacks.wait === undefined ||
+          newCallbacks.kill === undefined ||
+          newCallbacks.release === undefined ||
+          newCallbacks.permission === undefined ||
+          replacementRaw == null
+        ) {
+          return yield* Effect.die("Expected replacement ACP terminal and permission callbacks");
+        }
+        for (const [method, handler] of [
+          ["terminal/output", newCallbacks.output],
+          ["terminal/wait_for_exit", newCallbacks.wait],
+          ["terminal/kill", newCallbacks.kill],
+          ["terminal/release", newCallbacks.release],
+        ] as const) {
+          const result = yield* handler(
+            { sessionId: replacementRaw, terminalId: oldTerminal.terminalId },
+            { requestId: "replaced-terminal-access", method },
+          ).pipe(Effect.result);
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            if (!isAcpRequestError(result.failure))
+              return yield* Effect.die("Expected typed stale terminal rejection");
+            assert.equal(result.failure.code, -32602);
+          }
+        }
+        const staleCreate = yield* oldCallbacks
+          .create(
+            { sessionId: replacementRaw, command: process.execPath, args: ["-e", ""] },
+            { requestId: "stale-runtime-terminal-create", method: "terminal/create" },
+          )
+          .pipe(Effect.result);
+        assert.equal(staleCreate._tag, "Failure");
+        if (staleCreate._tag === "Failure") {
+          if (!isAcpRequestError(staleCreate.failure))
+            return yield* Effect.die("Expected typed stale callback rejection");
+          assert.equal(staleCreate.failure.code, -32602);
+        }
+        const newTerminal = yield* newCallbacks.create(
+          {
+            sessionId: replacementRaw,
+            command: process.execPath,
+            args: ["-e", "process.stdout.write('replacement terminal')"],
+          },
+          { requestId: "replacement-terminal-create", method: "terminal/create" },
+        );
+        yield* newCallbacks.wait(
+          { sessionId: replacementRaw, terminalId: newTerminal.terminalId },
+          { requestId: "replacement-terminal-wait", method: "terminal/wait_for_exit" },
+        );
+        const newOutput = yield* newCallbacks.output(
+          { sessionId: replacementRaw, terminalId: newTerminal.terminalId },
+          { requestId: "replacement-terminal-output", method: "terminal/output" },
+        );
+        assert.equal(newOutput.output, "replacement terminal");
+        yield* newCallbacks.release(
+          { sessionId: replacementRaw, terminalId: newTerminal.terminalId },
+          { requestId: "replacement-terminal-release", method: "terminal/release" },
+        );
+        yield* runtime.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread: replacement,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+            ordinal: 2,
+          }),
+        );
+        const events = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+        );
+        assert.isTrue(
+          events.some((event) => event.type === "turn.terminal" && event.status === "completed"),
+        );
+        const methods = yield* pollProtocolMethods(protocolEvents);
+        assert.equal(methods.filter((method) => method === "session/new").length, 2);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.each(["stale-session", "mock-session-1"] as const)(
+    "preserves new-session fallback when an eager ACP session load is stale (%s)",
+    (staleNativeThreadId) =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+        const instanceId = ProviderInstanceId.make("acp-test-stale-eager-resume");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              protocolEvents,
+              environment: (runtimeOrdinal) =>
+                runtimeOrdinal === 1 ? { T3_ACP_FAIL_LOAD_SESSION: "1" } : {},
+            }),
+          },
+          selfInvocation,
+        });
+        const threadId = ThreadId.make("thread-acp-stale-eager-resume");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const persistedProviderThreadId = idAllocator.derive.providerThread({
+          driver: ACP_TEST_DRIVER,
+          providerInstanceId: instanceId,
+          nativeThreadId: staleNativeThreadId,
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-stale-eager-resume"),
+          modelSelection,
+          runtimePolicy,
+          initialProviderThreadId: persistedProviderThreadId,
+          initialNativeThreadId: staleNativeThreadId,
+        });
+        const replacementThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const staleThread: OrchestrationV2ProviderThread = {
+          ...replacementThread,
+          id: persistedProviderThreadId,
+          nativeMetadata: null,
+          nativeThreadRef: {
+            driver: ACP_TEST_DRIVER,
+            nativeId: staleNativeThreadId,
+            strength: "strong",
+          },
+        };
+
+        const startupMethods = yield* pollProtocolMethods(protocolEvents);
+        assert.equal(startupMethods.filter((method) => method === "session/resume").length, 1);
+        assert.equal(startupMethods.filter((method) => method === "session/new").length, 1);
+
+        const assertInitialFailure = (result: Exit.Exit<unknown, unknown>) => {
+          assert.isTrue(Exit.isFailure(result));
+          if (Exit.isFailure(result))
+            assert.include(Cause.pretty(result.cause), "Mock load session failure");
+        };
+        for (const ordinal of [1, 2]) {
+          assertInitialFailure(
+            yield* Effect.exit(
+              runtime.resumeThread({
+                providerThread: staleThread,
+                modelSelection,
+                runtimePolicy,
+              }),
+            ),
+          );
+          assertInitialFailure(
+            yield* Effect.exit(
+              runtime.startTurn(
+                makeTurnInput({
+                  threadId,
+                  providerThread: staleThread,
+                  instanceId,
+                  runtimePolicy,
+                  now: yield* DateTime.now,
+                  ordinal,
+                }),
+              ),
+            ),
+          );
+          assertInitialFailure(
+            yield* Effect.exit(
+              runtime.readThreadSnapshot({
+                providerThread: staleThread,
+              }),
+            ),
+          );
+        }
+        const refusedMethods = yield* pollProtocolMethods(protocolEvents);
+        assert.notInclude(refusedMethods, "session/resume");
+        assert.notInclude(refusedMethods, "session/load");
+        assert.notInclude(refusedMethods, "session/prompt");
+        assert.notEqual(replacementThread.id, persistedProviderThreadId);
+        if (staleNativeThreadId === "mock-session-1")
+          assert.equal(replacementThread.nativeThreadRef?.nativeId, staleNativeThreadId);
+        else assert.notEqual(replacementThread.nativeThreadRef?.nativeId, staleNativeThreadId);
+        const preservedReplacement = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(preservedReplacement.nativeMetadata?.itemIdentityVersion, 3);
+        assert.isString(preservedReplacement.nativeMetadata?.itemIdentityScope);
+        assert.deepEqual(preservedReplacement.nativeMetadata, replacementThread.nativeMetadata);
+        const now = yield* DateTime.now;
+        yield* runtime.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread: preservedReplacement,
+            instanceId,
+            runtimePolicy,
+            now,
+            ordinal: 1,
+          }),
+        );
+        const terminal = Array.from(
+          yield* runtime.events.pipe(
+            Stream.takeUntil((event) => event.type === "turn.terminal"),
+            Stream.runCollect,
+          ),
+        ).find((event) => event.type === "turn.terminal");
+        assert.equal(terminal?.status, "completed");
+        assert.equal(
+          terminal?.providerTurnId,
+          idAllocator.derive.providerTurn({
+            driver: ACP_TEST_DRIVER,
+            ...acpItemIdentityScope(preservedReplacement),
+            nativeTurnId: acpScopedNativeId(
+              instanceId,
+              `${preservedReplacement.nativeThreadRef?.nativeId}:turn:1`,
+            ),
+          }),
+        );
+        assert.equal(
+          (yield* pollProtocolMethods(protocolEvents)).filter(
+            (method) => method === "session/prompt",
+          ).length,
+          1,
+        );
+      }).pipe(Effect.provide(layerTest)),
   );
 
   it.live("replaces an unexpectedly terminated ACP runtime before the next turn", () =>
@@ -5195,6 +5969,7 @@ describe("AcpAdapterV2", () => {
       yield* Deferred.await(rejected);
       const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(harness.providerThread),
         nativeTurnId: acpScopedNativeId(
           ProviderInstanceId.make("acp-prompt-inactivity"),
           "mock-session-1:turn:2",
@@ -5389,10 +6164,13 @@ describe("AcpAdapterV2", () => {
   it.effect("negotiates and executes optional native session forks through the ACP runtime", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const selfInvocation = yield* resolveSelfInvocation();
       const mockAgentPath = yield* bundledMockAgentPath;
       const protocolEvents = yield* Queue.bounded<EffectAcpProtocol.AcpProtocolLogEvent>(256);
       type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let sessionUpdateHandler: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      let failNextFork = true;
       let createTerminal: Parameters<RuntimeService["handleCreateTerminal"]>[0] | undefined;
       let readTerminalOutput: Parameters<RuntimeService["handleTerminalOutput"]>[0] | undefined;
       let waitForTerminalExit:
@@ -5404,6 +6182,27 @@ describe("AcpAdapterV2", () => {
         protocolEvents,
         wrapRuntime: (runtime) => ({
           ...runtime,
+          handleSessionUpdate: (handler) =>
+            Effect.sync(() => {
+              sessionUpdateHandler = handler;
+            }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+          forkSession: (...args) =>
+            Effect.gen(function* () {
+              if (failNextFork) {
+                failNextFork = false;
+                return yield* EffectAcpErrors.AcpRequestError.internalError("Mock fork failed");
+              }
+              assert.isDefined(sessionUpdateHandler);
+              yield* sessionUpdateHandler!({
+                sessionId: `${args[0]}-fork`,
+                update: {
+                  sessionUpdate: "agent_message",
+                  messageId: "fork-history",
+                  content: [{ type: "text", text: "fork replay before response" }],
+                },
+              });
+              return yield* runtime.forkSession(...args);
+            }),
           handleCreateTerminal: (handler) =>
             Effect.sync(() => {
               createTerminal = handler;
@@ -5475,6 +6274,44 @@ describe("AcpAdapterV2", () => {
         modelSelection,
         runtimePolicy,
       });
+      const failedFork = yield* runtime
+        .forkThread({
+          sourceProviderThread,
+          targetThreadId,
+        })
+        .pipe(Effect.result);
+      assert.equal(failedFork._tag, "Failure");
+      const preservedSource = yield* runtime.ensureThread({
+        threadId: sourceThreadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      assert.equal(preservedSource.id, sourceProviderThread.id);
+      assert.deepEqual(preservedSource.nativeMetadata, sourceProviderThread.nativeMetadata);
+      yield* runtime.startTurn(
+        makeTurnInput({
+          threadId: sourceThreadId,
+          providerThread: sourceProviderThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+        }),
+      );
+      const sourceTerminal = Option.getOrThrow(
+        yield* runtime.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+        ),
+      );
+      assert.equal(sourceTerminal.status, "completed");
+      assert.equal(
+        sourceTerminal.providerTurnId,
+        idAllocator.derive.providerTurn({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(sourceProviderThread),
+          nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
+        }),
+      );
       const forkedProviderThread = yield* runtime.forkThread({
         sourceProviderThread,
         targetThreadId,
@@ -5496,6 +6333,60 @@ describe("AcpAdapterV2", () => {
       assert.equal(forkedProviderThread.nativeThreadRef?.nativeId, "mock-session-1-fork");
       assert.equal(forkedProviderThread.appThreadId, targetThreadId);
       assert.equal(forkedProviderThread.forkedFrom?.providerThreadId, sourceProviderThread.id);
+      assert.equal(forkedProviderThread.nativeMetadata?.itemIdentityVersion, 3);
+      assert.isString(forkedProviderThread.nativeMetadata?.itemIdentityScope);
+      assert.notEqual(
+        forkedProviderThread.nativeMetadata?.itemIdentityScope,
+        sourceProviderThread.nativeMetadata?.itemIdentityScope,
+      );
+      const forkSnapshot = yield* runtime.readThreadSnapshot({
+        providerThread: forkedProviderThread,
+      });
+      const replayMessage = forkSnapshot.messages.find(
+        (message) => message.text === "fork replay before response",
+      );
+      assert.equal(
+        replayMessage?.id,
+        idAllocator.derive.messageFromProviderItem({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(forkedProviderThread),
+          nativeItemId: acpScopedNativeId(
+            instanceId,
+            "mock-session-1-fork:history:assistant:message:fork-history",
+          ),
+        }),
+      );
+      yield* sessionUpdateHandler!({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "agent_message",
+          messageId: "late-source-history",
+          content: [{ type: "text", text: "late source replay after fork" }],
+        },
+      });
+      const afterLateSource = yield* runtime.readThreadSnapshot({
+        providerThread: forkedProviderThread,
+      });
+      assert.isFalse(
+        afterLateSource.messages.some(
+          (message) => message.text === "late source replay after fork",
+        ),
+      );
+      const sourceSnapshot = yield* runtime.readThreadSnapshot({
+        providerThread: sourceProviderThread,
+      });
+      assert.equal(
+        sourceSnapshot.messages.find((message) => message.text === "late source replay after fork")
+          ?.id,
+        idAllocator.derive.messageFromProviderItem({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(sourceProviderThread),
+          nativeItemId: acpScopedNativeId(
+            instanceId,
+            "mock-session-1:history:assistant:message:late-source-history",
+          ),
+        }),
+      );
       assert.deepEqual(forkRequest.params, {
         sessionId: "mock-session-1",
         cwd: process.cwd(),
@@ -5516,11 +6407,18 @@ describe("AcpAdapterV2", () => {
           },
         ],
       });
-      yield* runtime.ensureThread({
-        threadId: sourceThreadId,
+      yield* runtime.resumeThread({
+        providerThread: forkedProviderThread,
         modelSelection,
         runtimePolicy,
       });
+      const ensuredFork = yield* runtime.ensureThread({
+        threadId: targetThreadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      assert.equal(ensuredFork.id, forkedProviderThread.id);
+      assert.equal(ensuredFork.appThreadId, targetThreadId);
       if (
         createTerminal === undefined ||
         readTerminalOutput === undefined ||
@@ -5532,25 +6430,17 @@ describe("AcpAdapterV2", () => {
         {
           sessionId: "mock-child-session-without-credential-scope",
           command: process.execPath,
-          args: ["-e", "process.stdout.write(process.env.T3_ACP_MCP_AUTHORIZATION ?? '')"],
+          args: ["-e", "process.stdout.write('unexpected')"],
         },
         { requestId: "test-unknown-terminal-create", method: "terminal/create" },
-      );
-      yield* waitForTerminalExit(
-        {
-          sessionId: "mock-child-session-without-credential-scope",
-          terminalId: unknownTerminal.terminalId,
-        },
-        { requestId: "test-unknown-terminal-wait", method: "terminal/wait_for_exit" },
-      );
-      const unknownTerminalOutput = yield* readTerminalOutput(
-        {
-          sessionId: "mock-child-session-without-credential-scope",
-          terminalId: unknownTerminal.terminalId,
-        },
-        { requestId: "test-unknown-terminal-output", method: "terminal/output" },
-      );
-      assert.equal(unknownTerminalOutput.output, "");
+      ).pipe(Effect.result);
+      assert.equal(unknownTerminal._tag, "Failure");
+      if (unknownTerminal._tag === "Failure") {
+        if (!isAcpRequestError(unknownTerminal.failure)) {
+          return yield* Effect.die("Expected typed ACP request rejection for unknown session");
+        }
+        assert.equal(unknownTerminal.failure.code, -32602);
+      }
 
       const terminal = yield* createTerminal(
         {
@@ -5581,6 +6471,217 @@ describe("AcpAdapterV2", () => {
         terminalOutput.output,
         "thread-acp-native-fork-target\nBearer target-thread-token",
       );
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps idle ACP policy and cwd scoped to the resumed owner", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* bundledMockAgentPath;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-acp-idle-policy-",
+      });
+      const sourceDirectory = path.join(directory, "source");
+      const targetDirectory = path.join(directory, "target");
+      yield* fileSystem.makeDirectory(sourceDirectory);
+      yield* fileSystem.makeDirectory(targetDirectory);
+      const sourceCwd = yield* fileSystem.realPath(sourceDirectory);
+      const targetCwd = yield* fileSystem.realPath(targetDirectory);
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let createTerminal: Parameters<RuntimeService["handleCreateTerminal"]>[0] | undefined;
+      let readTerminalOutput: Parameters<RuntimeService["handleTerminalOutput"]>[0] | undefined;
+      let waitForTerminalExit:
+        | Parameters<RuntimeService["handleTerminalWaitForExit"]>[0]
+        | undefined;
+      let readTextFile: Parameters<RuntimeService["handleReadTextFile"]>[0] | undefined;
+      let writeTextFile: Parameters<RuntimeService["handleWriteTextFile"]>[0] | undefined;
+      let elicit: Parameters<RuntimeService["handleElicitation"]>[0] | undefined;
+      const fileReads: Array<string | null> = [];
+      const fileWrites: Array<string | null> = [];
+      let urlCallbacks = 0;
+      const makeRuntime = makeMockRuntime({
+        childProcessSpawner,
+        mockAgentPath,
+        wrapRuntime: (runtime) => ({
+          ...runtime,
+          handleCreateTerminal: (handler) =>
+            Effect.sync(() => {
+              createTerminal = handler;
+            }).pipe(Effect.andThen(runtime.handleCreateTerminal(handler))),
+          handleTerminalOutput: (handler) =>
+            Effect.sync(() => {
+              readTerminalOutput = handler;
+            }).pipe(Effect.andThen(runtime.handleTerminalOutput(handler))),
+          handleTerminalWaitForExit: (handler) =>
+            Effect.sync(() => {
+              waitForTerminalExit = handler;
+            }).pipe(Effect.andThen(runtime.handleTerminalWaitForExit(handler))),
+          handleReadTextFile: (handler) =>
+            Effect.sync(() => {
+              readTextFile = handler;
+            }).pipe(Effect.andThen(runtime.handleReadTextFile(handler))),
+          handleWriteTextFile: (handler) =>
+            Effect.sync(() => {
+              writeTextFile = handler;
+            }).pipe(Effect.andThen(runtime.handleWriteTextFile(handler))),
+          handleElicitation: (handler) =>
+            Effect.sync(() => {
+              elicit = handler;
+            }).pipe(Effect.andThen(runtime.handleElicitation(handler))),
+        }),
+      });
+      const instanceId = ProviderInstanceId.make("acp-test-idle-policy-owner");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime,
+          clientFileSystem: {
+            readTextFile: (_request, cwd) =>
+              Effect.sync(() => {
+                fileReads.push(cwd);
+                return { content: "fake read" };
+              }),
+            writeTextFile: (_request, cwd) =>
+              Effect.sync(() => {
+                fileWrites.push(cwd);
+                return {};
+              }),
+          },
+          onUrlElicitation: () =>
+            Effect.sync(() => {
+              urlCallbacks += 1;
+              return true;
+            }),
+        },
+        selfInvocation,
+        clientTerminals: {},
+      });
+      const sourceThreadId = ThreadId.make("thread-acp-idle-policy-source");
+      const targetThreadId = ThreadId.make("thread-acp-idle-policy-target");
+      const sourcePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: sourceCwd,
+      });
+      const targetPolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        cwd: targetCwd,
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId: sourceThreadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-idle-policy-owner"),
+        modelSelection,
+        runtimePolicy: sourcePolicy,
+      });
+      const source = yield* runtime.ensureThread({
+        threadId: sourceThreadId,
+        modelSelection,
+        runtimePolicy: sourcePolicy,
+      });
+      const target = yield* runtime.forkThread({ sourceProviderThread: source, targetThreadId });
+      yield* runtime.resumeThread({
+        providerThread: target,
+        modelSelection,
+        runtimePolicy: targetPolicy,
+      });
+      if (
+        createTerminal === undefined ||
+        readTerminalOutput === undefined ||
+        waitForTerminalExit === undefined ||
+        readTextFile === undefined ||
+        writeTextFile === undefined ||
+        elicit === undefined
+      ) {
+        return yield* Effect.die(
+          "ACP runtime must register terminal, filesystem and elicitation handlers",
+        );
+      }
+      const sourceRaw = source.nativeThreadRef?.nativeId;
+      const targetRaw = target.nativeThreadRef?.nativeId;
+      if (sourceRaw == null || targetRaw == null)
+        return yield* Effect.die("Expected native session IDs");
+      const targetTerminal = yield* createTerminal(
+        { sessionId: targetRaw, command: process.execPath, args: ["-e", ""] },
+        { requestId: "idle-target-terminal", method: "terminal/create" },
+      ).pipe(Effect.result);
+      for (const sessionId of [sourceRaw, "unknown-idle-native-session"]) {
+        const read = yield* readTextFile(
+          { sessionId, path: "/unused/fake.txt" },
+          { requestId: "foreign-idle-read", method: "fs/read_text_file" },
+        ).pipe(Effect.result);
+        const write = yield* writeTextFile(
+          { sessionId, path: "/unused/fake.txt", content: "fake" },
+          { requestId: "foreign-idle-write", method: "fs/write_text_file" },
+        ).pipe(Effect.result);
+        for (const result of [read, write]) {
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") {
+            if (!isAcpRequestError(result.failure))
+              return yield* Effect.die("Expected typed foreign filesystem rejection");
+            assert.equal(result.failure.code, -32602);
+          }
+        }
+        const request = {
+          sessionId,
+          mode: "url" as const,
+          elicitationId: "foreign-idle-url",
+          message: "Open URL",
+          url: "https://example.invalid/acp-ownership-test",
+        };
+        assert.deepEqual(
+          yield* elicit(request, {
+            requestId: "foreign-idle-url",
+            method: "elicitation/create",
+          }),
+          { action: "cancel" },
+        );
+      }
+      assert.deepEqual(fileReads, []);
+      assert.deepEqual(fileWrites, []);
+      assert.equal(urlCallbacks, 0);
+      assert.deepEqual(
+        yield* readTextFile(
+          { sessionId: targetRaw, path: "/unused/fake.txt" },
+          { requestId: "target-idle-read", method: "fs/read_text_file" },
+        ),
+        { content: "fake read" },
+      );
+      assert.deepEqual(fileReads, [targetCwd]);
+      yield* runtime.resumeThread({
+        providerThread: source,
+        modelSelection,
+        runtimePolicy: sourcePolicy,
+      });
+      const terminal = yield* createTerminal(
+        {
+          sessionId: sourceRaw,
+          command: process.execPath,
+          args: ["-e", "process.stdout.write(process.cwd())"],
+        },
+        { requestId: "idle-source-terminal", method: "terminal/create" },
+      );
+      yield* waitForTerminalExit(
+        { sessionId: sourceRaw, terminalId: terminal.terminalId },
+        { requestId: "idle-source-terminal-wait", method: "terminal/wait_for_exit" },
+      );
+      const output = yield* readTerminalOutput(
+        { sessionId: sourceRaw, terminalId: terminal.terminalId },
+        { requestId: "idle-source-terminal-output", method: "terminal/output" },
+      );
+      assert.equal(output.output, sourceCwd);
+      assert.equal(targetTerminal._tag, "Failure");
+      if (targetTerminal._tag === "Failure") {
+        if (!isAcpRequestError(targetTerminal.failure))
+          return yield* Effect.die("Expected typed idle target policy rejection");
+        assert.equal(targetTerminal.failure.code, -32603);
+      }
     }).pipe(Effect.provide(layerTest)),
   );
 
@@ -5672,6 +6773,193 @@ describe("AcpAdapterV2", () => {
           { method: "fs/read_text_file", errorCode: -32601 },
         ]);
         assert.isFalse(yield* fileSystem.exists(probePath));
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    { runtimeMode: "approval-required", permissionQuestion: false },
+    { runtimeMode: "full-access", permissionQuestion: false },
+    { runtimeMode: "approval-required", permissionQuestion: true },
+  ] as const)(
+    "rejects permissions from another ACP owner ($runtimeMode, question=$permissionQuestion)",
+    ({ runtimeMode, permissionQuestion }) =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let requestPermission: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+        let runtimeInput: AcpAdapterV2RuntimeInput | undefined;
+        const makeRuntime = makeMockRuntime({
+          childProcessSpawner,
+          mockAgentPath,
+          protocolEvents,
+          environment: { T3_ACP_HANG_PROMPT_FOREVER: "1" },
+          wrapRuntime: (runtime) => ({
+            ...runtime,
+            handleRequestPermission: (handler) =>
+              Effect.sync(() => {
+                requestPermission = handler;
+              }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
+          }),
+        });
+        const instanceId = ProviderInstanceId.make("acp-test-permission-owner");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            interruptPromptOnCancel: true,
+            ...(permissionQuestion
+              ? {
+                  extractPermissionQuestion: () => ({
+                    question: {
+                      id: "branch",
+                      header: "Branch",
+                      question: "Which branch?",
+                      options: [],
+                    },
+                    respond: () => ({ outcome: { outcome: "cancelled" as const } }),
+                  }),
+                }
+              : {}),
+            makeRuntime: (input) =>
+              Effect.sync(() => {
+                runtimeInput = input;
+              }).pipe(Effect.andThen(makeRuntime(input))),
+          },
+          selfInvocation,
+        });
+        const sourceThreadId = ThreadId.make("thread-acp-permission-owner-source");
+        const targetThreadId = ThreadId.make("thread-acp-permission-owner-target");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode,
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId: sourceThreadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-permission-owner"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const sourceProviderThread = yield* runtime.ensureThread({
+          threadId: sourceThreadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const targetProviderThread = yield* runtime.forkThread({
+          sourceProviderThread,
+          targetThreadId,
+        });
+        const sourceRaw = sourceProviderThread.nativeThreadRef?.nativeId;
+        const targetRaw = targetProviderThread.nativeThreadRef?.nativeId;
+        if (sourceRaw == null || targetRaw == null) {
+          return yield* Effect.die("Expected native source and fork session IDs");
+        }
+        assert.notEqual(sourceRaw, targetRaw);
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const targetTurnId = idAllocator.derive.providerTurn({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(targetProviderThread),
+          nativeTurnId: acpScopedNativeId(instanceId, `${targetRaw}:turn:1`),
+        });
+        const turnFiber = yield* runtime
+          .startTurn(
+            makeTurnInput({
+              threadId: targetThreadId,
+              providerThread: targetProviderThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Effect.gen(function* () {
+          const prompt = Option.getOrThrow(
+            yield* Stream.fromQueue(protocolEvents).pipe(
+              Stream.filter(
+                (event) =>
+                  event.direction === "outgoing" && rawProtocolMethod(event) === "session/prompt",
+              ),
+              Stream.runHead,
+            ),
+          );
+          assert.equal(rawProtocolRequestParam(prompt, "sessionId"), targetRaw);
+          if (requestPermission === undefined || runtimeInput?.onOutgoingResponse === undefined) {
+            return yield* Effect.die(
+              "ACP runtime must register permission and acknowledgement handlers",
+            );
+          }
+          const outcomes: Array<{ sessionId: string; kind: string; outcome?: string }> = [];
+          for (const sessionId of [sourceRaw, "unknown-native-session"]) {
+            const nativeRequestId = "shared-native-permission-request";
+            const permissionFiber = yield* requestPermission(
+              {
+                sessionId,
+                toolCall: {
+                  toolCallId: "shared-permission-tool",
+                  title: "Run command",
+                  kind: "execute",
+                },
+                options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],
+              },
+              { requestId: nativeRequestId, method: "session/request_permission" },
+            ).pipe(Effect.forkScoped);
+            const result = yield* Effect.race(
+              Fiber.join(permissionFiber).pipe(
+                Effect.map((response) => ({ kind: "response" as const, response })),
+              ),
+              runtime.events.pipe(
+                Stream.filter(
+                  (event) =>
+                    event.type === "runtime_request.updated" &&
+                    event.runtimeRequest.status === "pending",
+                ),
+                Stream.runHead,
+                Effect.flatMap((event) => {
+                  const pending = Option.getOrThrow(event);
+                  return pending.type === "runtime_request.updated"
+                    ? Effect.succeed({ kind: "pending" as const, request: pending.runtimeRequest })
+                    : Effect.die("Expected pending ACP runtime request");
+                }),
+              ),
+            );
+            if (result.kind === "pending") {
+              outcomes.push({ sessionId, kind: result.kind });
+              assert.equal(result.request.providerTurnId, targetTurnId);
+              const cancelResponse = yield* runtime
+                .respondToRuntimeRequest({ requestId: result.request.id, decision: "cancel" })
+                .pipe(Effect.forkScoped);
+              yield* Fiber.join(permissionFiber);
+              yield* runtimeInput.onOutgoingResponse(nativeRequestId);
+              yield* Fiber.join(cancelResponse);
+            } else {
+              outcomes.push({
+                sessionId,
+                kind: result.kind,
+                outcome: result.response.outcome.outcome,
+              });
+              yield* runtimeInput.onOutgoingResponse(nativeRequestId);
+            }
+          }
+          assert.deepEqual(
+            outcomes,
+            [sourceRaw, "unknown-native-session"].map((sessionId) => ({
+              sessionId,
+              kind: "response",
+              outcome: "cancelled",
+            })),
+          );
+        }).pipe(
+          Effect.ensuring(
+            runtime
+              .interruptTurn({ providerThread: targetProviderThread, providerTurnId: targetTurnId })
+              .pipe(Effect.andThen(Fiber.join(turnFiber)), Effect.orDie),
+          ),
+        );
       }).pipe(Effect.provide(layerTest)),
   );
 
@@ -5831,7 +7119,13 @@ describe("AcpAdapterV2", () => {
       requestKind: "other",
       granted: false,
     },
-  ] as const)("$label", ({ kind, granted, ...testCase }) =>
+    {
+      label: "does not inherit a source session execute grant across a native fork",
+      kind: "execute",
+      granted: true,
+      forkCheck: true,
+    },
+  ] as const)("tracks execute approval grants ($label)", ({ kind, granted, ...testCase }) =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const selfInvocation = yield* resolveSelfInvocation();
@@ -5942,7 +7236,10 @@ describe("AcpAdapterV2", () => {
       const approval = approvalEvent.turnItem;
       const providerTurnId = approvalEvent.turnItem.providerTurnId;
       const responseFiber = yield* runtime
-        .respondToRuntimeRequest({ requestId: approval.requestId, decision: "accept" })
+        .respondToRuntimeRequest({
+          requestId: approval.requestId,
+          decision: "forkCheck" in testCase ? "acceptForSession" : "accept",
+        })
         .pipe(Effect.forkScoped);
       assert.equal((yield* Fiber.join(permissionFiber)).outcome.outcome, "selected");
       if (runtimeInput?.onOutgoingResponse === undefined) {
@@ -5970,6 +7267,62 @@ describe("AcpAdapterV2", () => {
 
       yield* runtime.interruptTurn({ providerThread, providerTurnId });
       yield* Fiber.join(turnFiber);
+      if ("forkCheck" in testCase) {
+        const targetThreadId = ThreadId.make("thread-acp-id-only-permission-fork");
+        const targetProviderThread = yield* runtime.forkThread({
+          sourceProviderThread: providerThread,
+          targetThreadId,
+        });
+        const targetRaw = targetProviderThread.nativeThreadRef?.nativeId;
+        if (targetRaw == null) return yield* Effect.die("Expected native fork session ID");
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const targetTurnId = idAllocator.derive.providerTurn({
+          driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(targetProviderThread),
+          nativeTurnId: acpScopedNativeId(instanceId, `${targetRaw}:turn:1`),
+        });
+        const targetTurn = yield* runtime
+          .startTurn(
+            makeTurnInput({
+              threadId: targetThreadId,
+              providerThread: targetProviderThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Effect.gen(function* () {
+          yield* runtime.events.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.threadId === targetThreadId &&
+                event.turnItem.nativeItemRef?.nativeId === "tracked-tool-call",
+            ),
+            Stream.runHead,
+          );
+          if (createTerminal === undefined)
+            return yield* Effect.die("ACP runtime must register its terminal handler");
+          const targetTerminal = yield* createTerminal(
+            { sessionId: targetRaw, command: process.execPath, args: ["-e", ""] },
+            { requestId: "fork-inherited-permission-terminal", method: "terminal/create" },
+          ).pipe(Effect.result);
+          assert.equal(targetTerminal._tag, "Failure");
+          if (targetTerminal._tag === "Failure") {
+            if (!isAcpRequestError(targetTerminal.failure)) {
+              return yield* Effect.die("Expected typed ACP policy rejection for unapproved fork");
+            }
+            assert.equal(targetTerminal.failure.code, -32603);
+          }
+        }).pipe(
+          Effect.ensuring(
+            runtime
+              .interruptTurn({ providerThread: targetProviderThread, providerTurnId: targetTurnId })
+              .pipe(Effect.andThen(Fiber.join(targetTurn)), Effect.orDie),
+          ),
+        );
+      }
     }).pipe(Effect.provide(layerTest)),
   );
 
@@ -6111,16 +7464,7 @@ describe("AcpAdapterV2", () => {
       const selfInvocation = yield* resolveSelfInvocation();
       const mockAgentPath = yield* bundledMockAgentPath;
       const instanceId = ProviderInstanceId.make("acp-test-rollback-session");
-      const rollbackThreadId = ThreadId.make("thread-acp-rollback-session-target");
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
-        environmentId: EnvironmentId.make("environment-acp-rollback-session-target"),
-        threadId: rollbackThreadId,
-        providerSessionId: "mcp-session-acp-rollback-session-target",
-        providerInstanceId: instanceId,
-        endpoint: "http://127.0.0.1:43124/mcp",
-        authorizationHeader: "Bearer rollback-target-token",
-        browserToolsAvailable: false,
-      });
+      const rollbackThreadId = ThreadId.make("thread-acp-rollback-session");
       const runtimeInputs: Array<AcpAdapterV2RuntimeInput> = [];
       const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
       const nativeRuntimes: Array<AcpSessionRuntime.AcpSessionRuntime["Service"]> = [];
@@ -6202,6 +7546,7 @@ describe("AcpAdapterV2", () => {
       }
       const firstProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, `${firstSessionId}:turn:1`),
       });
       while (true) {
@@ -6210,8 +7555,39 @@ describe("AcpAdapterV2", () => {
       }
       const snapshotBeforeRollback = yield* runtime.readThreadSnapshot({ providerThread });
 
+      const foreignRollback = yield* runtime
+        .rollbackThread({
+          providerThread: {
+            ...providerThread,
+            appThreadId: ThreadId.make("thread-acp-rollback-session-foreign"),
+          },
+          providerThreadTurns: snapshotBeforeRollback.providerTurns,
+          target: {
+            type: "thread_start",
+            checkpointId: CheckpointId.make("checkpoint-acp-foreign-rollback"),
+            appRunOrdinal: 0,
+          },
+        })
+        .pipe(Effect.result);
+      assert.equal(foreignRollback._tag, "Failure");
+      if (foreignRollback._tag === "Failure") {
+        assert.isTrue(isProviderAdapterProtocolError(foreignRollback.failure.cause));
+        if (isProviderAdapterProtocolError(foreignRollback.failure.cause))
+          assert.equal(foreignRollback.failure.cause.reason, "session_owner_mismatch");
+      }
+      assert.equal(runtimeInputs.length, 1, "foreign ownership must not start a replacement");
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-acp-rollback-session-target"),
+        threadId: rollbackThreadId,
+        providerSessionId: "mcp-session-acp-rollback-session-target",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:43124/mcp",
+        authorizationHeader: "Bearer rollback-target-token",
+        browserToolsAvailable: false,
+      });
+
       const rolledBack = yield* runtime.rollbackThread({
-        providerThread: { ...providerThread, appThreadId: rollbackThreadId },
+        providerThread,
         providerThreadTurns: snapshotBeforeRollback.providerTurns,
         target: {
           type: "thread_start",
@@ -6220,6 +7596,14 @@ describe("AcpAdapterV2", () => {
         },
       });
       assert.isString(rolledBack.providerThread.nativeThreadRef?.nativeId);
+      assert.equal(rolledBack.providerThread.nativeThreadRef?.nativeId, firstSessionId);
+      assert.equal(rolledBack.providerThread.id, providerThread.id);
+      assert.equal(rolledBack.providerThread.nativeMetadata?.itemIdentityVersion, 3);
+      assert.isString(rolledBack.providerThread.nativeMetadata?.itemIdentityScope);
+      assert.notEqual(
+        rolledBack.providerThread.nativeMetadata?.itemIdentityScope,
+        providerThread.nativeMetadata?.itemIdentityScope,
+      );
       assert.deepEqual(rolledBack.providerTurns, []);
       assert.equal(
         runtimeInputs[1]?.processEnvironment?.T3_ACP_MCP_AUTHORIZATION,
@@ -6227,7 +7611,7 @@ describe("AcpAdapterV2", () => {
       );
       assert.equal(
         runtimeInputs[1]?.processEnvironment?.T3CODE_THREAD_ID,
-        "thread-acp-rollback-session-target",
+        "thread-acp-rollback-session",
       );
       const replacementMcpServer = runtimeInputs[1]?.mcpServers[0];
       const replacementMcpEnvironment =
@@ -6260,6 +7644,7 @@ describe("AcpAdapterV2", () => {
       );
       const secondProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(rolledBack.providerThread),
         nativeTurnId: acpScopedNativeId(
           instanceId,
           `${rolledBack.providerThread.nativeThreadRef?.nativeId}:turn:2`,
@@ -7160,6 +8545,7 @@ describe("AcpAdapterV2", () => {
       );
       const secondProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
       });
       yield* runtime.interruptTurn({
@@ -7940,6 +9326,7 @@ describe("AcpAdapterV2", () => {
       );
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       yield* runtime.interruptTurn({
@@ -8048,6 +9435,7 @@ describe("AcpAdapterV2", () => {
 
         const firstProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         yield* runtime.interruptTurn({ providerThread, providerTurnId: firstProviderTurnId });
@@ -8080,6 +9468,7 @@ describe("AcpAdapterV2", () => {
         );
         const secondProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
         });
         let carriedItemStatus: string | null = null;
@@ -8282,6 +9671,7 @@ describe("AcpAdapterV2", () => {
 
           const providerTurnId = idAllocator.derive.providerTurn({
             driver: ACP_TEST_DRIVER,
+            ...acpItemIdentityScope(providerThread),
             nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
           });
           let completedSubagentUpdates = 0;
@@ -8429,6 +9819,7 @@ describe("AcpAdapterV2", () => {
 
       const firstProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       let firstTerminalStatus: string | null = null;
@@ -8659,6 +10050,7 @@ describe("AcpAdapterV2", () => {
 
         const firstProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         yield* runtime.interruptTurn({ providerThread, providerTurnId: firstProviderTurnId });
@@ -8758,6 +10150,7 @@ describe("AcpAdapterV2", () => {
 
         const userProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
         });
         let userTurnTerminal: string | null = null;
@@ -8812,6 +10205,7 @@ describe("AcpAdapterV2", () => {
         yield* TestClock.adjust("3 seconds");
         const continuationProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:3"),
         });
         let continuationTerminal: string | null = null;
@@ -8936,6 +10330,7 @@ describe("AcpAdapterV2", () => {
 
         const firstProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         yield* runtime.interruptTurn({ providerThread, providerTurnId: firstProviderTurnId });
@@ -8972,6 +10367,7 @@ describe("AcpAdapterV2", () => {
         );
         const secondProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
         });
         let carriedItemStatus: string | null = null;
@@ -9060,6 +10456,7 @@ describe("AcpAdapterV2", () => {
       );
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       const interruptExit = yield* runtime
@@ -9181,6 +10578,7 @@ describe("AcpAdapterV2", () => {
 
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       yield* runtime.interruptTurn({ providerThread, providerTurnId, requestRuntimeRestart: true });
@@ -9294,6 +10692,7 @@ describe("AcpAdapterV2", () => {
         );
         const providerTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
 
@@ -9439,6 +10838,7 @@ describe("AcpAdapterV2", () => {
       );
       const firstProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       let firstTerminalStatus: string | null = null;
@@ -9489,6 +10889,7 @@ describe("AcpAdapterV2", () => {
 
       const userProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
       });
       let userTerminalStatus: string | null = null;
@@ -9520,6 +10921,7 @@ describe("AcpAdapterV2", () => {
       yield* TestClock.adjust("3 seconds");
       const continuationProviderTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:3"),
       });
       let continuationTerminalStatus: string | null = null;
@@ -9701,6 +11103,7 @@ describe("AcpAdapterV2", () => {
         yield* Deferred.succeed(promptGate, { stopReason: "end_turn" });
         const providerTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         let terminalStatus: string | null = null;
@@ -9951,6 +11354,7 @@ describe("AcpAdapterV2", () => {
         yield* Deferred.succeed(promptGates[0]!, { stopReason: "end_turn" });
         const firstProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         let firstTerminal: string | null = null;
@@ -10086,6 +11490,7 @@ describe("AcpAdapterV2", () => {
         yield* Deferred.succeed(promptGates[1]!, { stopReason: "end_turn" });
         const secondProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
         });
         let secondTerminal: string | null = null;
@@ -10181,6 +11586,7 @@ describe("AcpAdapterV2", () => {
         Effect.gen(function* () {
           const providerTurnId = idAllocator.derive.providerTurn({
             driver: ACP_TEST_DRIVER,
+            ...acpItemIdentityScope(providerThread),
             nativeTurnId: acpScopedNativeId(instanceId, `mock-session-1:turn:${ordinal}`),
           });
           while (true) {
@@ -10527,6 +11933,7 @@ describe("AcpAdapterV2", () => {
       );
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       const interruptExit = yield* runtime
@@ -10616,6 +12023,7 @@ describe("AcpAdapterV2", () => {
       yield* Effect.yieldNow;
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       yield* pollProtocolMethods(protocolEvents);
@@ -10717,6 +12125,7 @@ describe("AcpAdapterV2", () => {
         .pipe(Effect.forkScoped);
       const providerTurnId = idAllocator.derive.providerTurn({
         driver: ACP_TEST_DRIVER,
+        ...acpItemIdentityScope(providerThread),
         nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
       });
       yield* pollProtocolMethods(protocolEvents);
@@ -10826,6 +12235,7 @@ describe("AcpAdapterV2", () => {
 
         const firstProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:1"),
         });
         yield* runtime.interruptTurn({
@@ -10862,6 +12272,7 @@ describe("AcpAdapterV2", () => {
         );
         const secondProviderTurnId = idAllocator.derive.providerTurn({
           driver: ACP_TEST_DRIVER,
+          ...acpItemIdentityScope(providerThread),
           nativeTurnId: acpScopedNativeId(instanceId, "mock-session-1:turn:2"),
         });
         let carriedCompleted = false;

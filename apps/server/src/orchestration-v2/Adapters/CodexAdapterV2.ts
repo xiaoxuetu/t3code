@@ -36,6 +36,7 @@ import {
   OrchestrationV2ProviderGoal,
   parseGoalCommand,
   ProviderDriverKind,
+  ProviderInstanceId,
   ProviderSetupError,
   type ServerProviderCompatibilityAdvisory,
   type ServerProviderModel,
@@ -77,7 +78,6 @@ import type {
   ProviderRequestKind,
   ProviderThreadId,
   ProviderTurnId,
-  ProviderInstanceId,
   RuntimeMode,
 } from "@t3tools/contracts";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -763,6 +763,25 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 
 const isCodexCyberAccessProgram = Schema.is(CodexSchema.V2TurnStartParams__CyberAccessProgram);
 
+class CodexSelectionUnavailableError extends Schema.TaggedError<CodexSelectionUnavailableError>()(
+  "CodexSelectionUnavailableError",
+  {
+    instanceId: ProviderInstanceId,
+    reason: Schema.Literals(["model_unavailable", "option_unavailable", "option_not_sent"]),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "model_unavailable":
+        return "Codex could not verify the requested model in its published catalog. Refresh the provider or choose an available model before retrying.";
+      case "option_unavailable":
+        return "An explicitly requested Codex option is unavailable or cannot be applied. Choose a supported option from the current model catalog before retrying.";
+      case "option_not_sent":
+        return "The requested Codex option cannot be sent by this runtime. Choose an available option before retrying.";
+    }
+  }
+}
+
 function codexCyberAccess(
   models: ReadonlyArray<ServerProviderModel>,
   model: string,
@@ -779,6 +798,8 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     readonly modelSelection: ModelSelection;
+    /** Published choices from the current snapshot, excluding user-configured custom candidates. */
+    readonly models?: ReadonlyArray<ServerProviderModel>;
     readonly hasT3Mcp?: boolean;
     readonly browserToolsAvailable?: boolean;
     readonly deviceToolsAvailable?: boolean;
@@ -790,6 +811,37 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     /** The user's `model_reasoning_summary` from the Codex config, when set. */
     readonly configuredReasoningSummary?: CodexSchema.V2TurnStartParams__ReasoningSummary;
   }) {
+    const strict = input.runtimePolicy.selectionPolicy === "strict";
+    if (strict) {
+      const model = input.models?.find(
+        (candidate) => candidate.slug === input.modelSelection.model,
+      );
+      if (model === undefined || model.isCustom) {
+        return yield* new CodexSelectionUnavailableError({
+          instanceId: input.modelSelection.instanceId,
+          reason: "model_unavailable",
+        });
+      }
+      const seenOptions = new Set<string>();
+      for (const selection of input.modelSelection.options ?? []) {
+        const descriptor = model.capabilities?.optionDescriptors?.find(
+          (option) => option.id === selection.id,
+        );
+        if (
+          seenOptions.has(selection.id) ||
+          !["reasoningEffort", "serviceTier", "cyberAccessProgram"].includes(selection.id) ||
+          descriptor?.type !== "select" ||
+          typeof selection.value !== "string" ||
+          !descriptor.options.some((option) => option.id === selection.value)
+        ) {
+          return yield* new CodexSelectionUnavailableError({
+            instanceId: input.modelSelection.instanceId,
+            reason: "option_unavailable",
+          });
+        }
+        seenOptions.add(selection.id);
+      }
+    }
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
       input.runtimePolicy.approvalPolicy === undefined
@@ -816,6 +868,19 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
             getModelSelectionStringOptionValue(input.modelSelection, "cyberAccessProgram"),
             input.cyberAccess.defaultProgram,
           ].find(isCodexCyberAccessProgram);
+    if (
+      strict &&
+      (input.modelSelection.options ?? []).some(
+        (selection) =>
+          (selection.id === "serviceTier" && serviceTier !== selection.value) ||
+          (selection.id === "cyberAccessProgram" && cyberAccessProgram !== selection.value),
+      )
+    ) {
+      return yield* new CodexSelectionUnavailableError({
+        instanceId: input.modelSelection.instanceId,
+        reason: "option_not_sent",
+      });
+    }
     // MCP-written app context must be quoted user input, not developer instructions.
     const appContext = Object.fromEntries(
       (input.appContext ?? []).map((entry) => [
@@ -7339,6 +7404,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               );
             const turnStartParams = yield* buildCodexTurnStartParams({
+              models,
               cyberAccess: codexCyberAccess(models, turnInput.modelSelection.model),
               nativeThreadId: threadId,
               codexInput,

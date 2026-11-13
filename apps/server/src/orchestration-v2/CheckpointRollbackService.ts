@@ -313,6 +313,7 @@ export const layer: Layer.Layer<
         providerSessionId: providerThread.providerSessionId,
         modelSelection,
         runtimePolicy: resolvedRuntimePolicy,
+        initialProviderThreadId: providerThread.id,
         ...(existingSession === undefined ? {} : { resumeFromSession: existingSession }),
         ...(providerThread.nativeThreadRef?.nativeId == null
           ? {}
@@ -322,6 +323,9 @@ export const layer: Layer.Layer<
           : {
               initialProviderItemIdentityVersion: providerThread.nativeMetadata.itemIdentityVersion,
             }),
+        ...(providerThread.nativeMetadata?.itemIdentityScope === undefined
+          ? {}
+          : { initialProviderItemIdentityScope: providerThread.nativeMetadata.itemIdentityScope }),
       });
 
       // Rolled-back turns remain in audit history but no longer exist in the provider conversation.

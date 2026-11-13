@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   CommandId,
   EventId,
+  MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
   MessageId,
   type NodeId,
   ProjectId,
@@ -19,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Result from "effect/Result";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -27,6 +29,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
+import { teamPlanReportCommand } from "./TeamPlanReport.ts";
 
 const instanceId = ProviderInstanceId.make("codex");
 const modelSelection = { instanceId, model: "fixture-model" };
@@ -104,6 +107,7 @@ const initialOperations: ReadonlyArray<TeamPlanOperation> = [
 const assertNoExecution = Effect.fn("TeamPlanCrud.assertNoExecution")(function* (
   threadId: ThreadId,
   commandId: CommandId,
+  existingEffects = 0,
 ) {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -117,7 +121,7 @@ const assertNoExecution = Effect.fn("TeamPlanCrud.assertNoExecution")(function* 
       (SELECT COUNT(*) FROM orchestration_v2_effect_outbox) AS effects,
       (SELECT COUNT(*) FROM orchestration_v2_projection_runs) AS runs
   `;
-  assert.deepEqual(counts, { effects: 0, runs: 0 });
+  assert.deepEqual(counts, { effects: existingEffects, runs: 0 });
 });
 
 type Coordinator = {
@@ -233,6 +237,206 @@ const boundTaskA = Effect.fn("TeamPlanRef.boundTaskA")(function* (name: string) 
   const child = yield* projections.getThreadProjection(execution.threadId);
   return { coordinator, request, first, parent, plan, execution, child };
 });
+
+const reportingPlan = Effect.fn("TeamPlanCrud.reportingPlan")(function* (name: string) {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = ThreadId.make(`thread:team-plan-report:${name}`);
+  yield* createThread(threadId);
+  yield* orchestrator.dispatch(patch(threadId, "initial", 0, initialOperations));
+  const draft = yield* projections.getTeamPlan(threadId);
+  if (draft === null) return yield* Effect.die("Missing synthetic reporting plan");
+  yield* orchestrator.dispatch(
+    patch(threadId, "enable-report", draft.version, [
+      { type: "confirm_plan", revision: draft.revision },
+      { type: "set_report_schedule", enabled: true, everyMs: MIN_TEAM_PLAN_REPORT_INTERVAL_MS },
+    ]),
+  );
+  const plan = yield* projections.getTeamPlan(threadId);
+  if (
+    plan?.reportSchedule?.nextReportAt === null ||
+    plan?.reportSchedule?.nextReportAt === undefined
+  )
+    return yield* Effect.die("Missing synthetic report occurrence");
+  const command = teamPlanReportCommand({
+    threadId,
+    planCreatedAt: plan.createdAt,
+    generation: plan.reportSchedule.generation,
+    dueAt: plan.reportSchedule.nextReportAt,
+  });
+  return { threadId, plan, command };
+});
+
+it.effect(
+  "records one due team-plan report without poisoning an early occurrence or starting work",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { threadId, plan, command } = yield* reportingPlan("due-and-idempotent");
+      const before = yield* orchestrator.getThreadEventSequence(threadId);
+      const early = yield* orchestrator.dispatch(command).pipe(Effect.result);
+      assert.isTrue(Result.isFailure(early));
+      if (Result.isFailure(early)) {
+        assert.instanceOf(early.failure, Orchestrator.OrchestratorTeamPlanPatchError);
+        if (early.failure._tag === "OrchestratorTeamPlanPatchError")
+          assert.equal(early.failure.reason, "not-due");
+      }
+      assert.deepEqual(yield* projections.getTeamPlan(threadId), plan);
+      yield* assertNoExecution(threadId, command.commandId);
+      yield* TestClock.adjust("90 seconds");
+      const observedAt = DateTime.formatIso(yield* DateTime.now);
+      const committed = yield* Effect.all(
+        [orchestrator.dispatch(command), orchestrator.dispatch(command)],
+        { concurrency: "unbounded" },
+      );
+      assert.deepEqual(committed.map((result) => result.replayed === true).sort(), [false, true]);
+      const reported = yield* projections.getTeamPlan(threadId);
+      assert.equal(reported?.version, plan.version + 1);
+      assert.equal(reported?.revision, plan.revision);
+      assert.equal(reported?.confirmedRevision, plan.confirmedRevision);
+      assert.deepEqual(reported?.tasks, plan.tasks);
+      assert.equal(
+        reported?.reportSchedule?.nextReportAt,
+        DateTime.formatIso(
+          DateTime.add(DateTime.makeUnsafe(observedAt), {
+            milliseconds: MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
+          }),
+        ),
+      );
+      assert.deepEqual(reported?.latestReport, {
+        planCreatedAt: plan.createdAt,
+        planVersion: plan.version,
+        planRevision: plan.revision,
+        generation: command.generation,
+        dueAt: command.dueAt,
+        observedAt,
+        dispatchPaused: false,
+        tasks: plan.tasks.map((task) => ({
+          taskId: task.taskId,
+          revision: task.revision,
+          current: true,
+          title: task.title,
+          role: task.role,
+          priority: task.priority,
+          acceptance: task.acceptance.status,
+          executions: [],
+        })),
+      });
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), before + 1);
+      const fresh = committed.find((result) => result.replayed !== true)!;
+      assert.lengthOf(fresh.storedEvents, 1);
+      assert.equal(fresh.storedEvents[0]!.event.type, "team-plan.updated");
+      // Keep only the SQL database; fresh layer memoization must rebuild the service instances.
+      const sql = yield* SqlClient.SqlClient;
+      const rebuilt = ProviderReplayHarness.layerWithRegistry(
+        { name: "team-plan-report-service-restart" },
+        ProviderAdapterRegistry.layerFromAdapters([adapter]),
+        {
+          databaseLayer: Layer.succeed(SqlClient.SqlClient, sql),
+          runEffectWorker: false,
+          runContinuationWorker: false,
+        },
+      );
+      yield* Effect.gen(function* () {
+        const restarted = yield* Orchestrator.OrchestratorV2;
+        assert.isFalse(
+          restarted === orchestrator,
+          "The rebuilt harness must create a new service instance.",
+        );
+        const recovered = yield* restarted.dispatch(command);
+        assert.isTrue(recovered.replayed);
+        assert.equal(recovered.sequence, fresh.sequence);
+        assert.deepEqual(
+          recovered.storedEvents.map((stored) => [
+            stored.sequence,
+            stored.commandId,
+            stored.event.id,
+          ]),
+          fresh.storedEvents.map((stored) => [stored.sequence, stored.commandId, stored.event.id]),
+        );
+        assert.deepEqual((yield* restarted.getThreadProjection(threadId)).teamPlan, reported);
+        assert.equal(yield* restarted.getThreadEventSequence(threadId), before + 1);
+        const records = yield* restarted.getThreadRecords(threadId, ["runs", "providerSessions"]);
+        assert.deepEqual(records.runs, []);
+        assert.deepEqual(records.providerSessions, []);
+        yield* assertNoExecution(threadId, command.commandId);
+      }).pipe(Effect.provide(Layer.fresh(rebuilt)));
+      const repeated = yield* orchestrator.dispatch(command);
+      assert.isTrue(repeated.replayed);
+      assert.deepEqual(yield* projections.getTeamPlan(threadId), reported);
+      assert.equal(yield* orchestrator.getThreadEventSequence(threadId), before + 1);
+      yield* assertNoExecution(threadId, command.commandId);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["disabled", "new-generation", "archived", "deleted"] as const)(
+  "refuses an obsolete team-plan report without recreating work (%s)",
+  (state) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { threadId, plan, command } = yield* reportingPlan(`obsolete:${state}`);
+      if (state === "disabled" || state === "new-generation") {
+        yield* orchestrator.dispatch(
+          patch(threadId, state, plan.version, [
+            {
+              type: "set_report_schedule",
+              enabled: state === "new-generation",
+              everyMs:
+                state === "new-generation"
+                  ? 2 * MIN_TEAM_PLAN_REPORT_INTERVAL_MS
+                  : MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
+            },
+          ]),
+        );
+      } else {
+        yield* orchestrator.dispatch({
+          type: state === "archived" ? "thread.archive" : "thread.delete",
+          commandId: CommandId.make(`report-owner:${state}`),
+          threadId,
+        });
+      }
+      yield* TestClock.adjust("2 minutes");
+      const settled = yield* projections.getTeamPlan(threadId);
+      const before = yield* executionSnapshot();
+      const sequence = yield* orchestrator.getThreadEventSequence(threadId);
+      for (const _attempt of [0, 1]) {
+        const result = yield* orchestrator.dispatch(command).pipe(Effect.result);
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) {
+          assert.instanceOf(result.failure, Orchestrator.OrchestratorTeamPlanPatchError);
+          if (result.failure._tag === "OrchestratorTeamPlanPatchError")
+            assert.equal(
+              result.failure.reason,
+              state === "disabled" || state === "new-generation"
+                ? "schedule-not-current"
+                : "report-owner-unavailable",
+            );
+        }
+        assert.deepEqual(yield* projections.getTeamPlan(threadId), settled);
+        assert.equal(yield* orchestrator.getThreadEventSequence(threadId), sequence);
+        assert.deepEqual(yield* executionSnapshot(), before);
+      }
+      if (state === "new-generation") {
+        const current = settled!.reportSchedule!;
+        assert.equal(current.generation, command.generation + 1);
+        const next = teamPlanReportCommand({
+          threadId,
+          planCreatedAt: settled!.createdAt,
+          generation: current.generation,
+          dueAt: current.nextReportAt!,
+        });
+        yield* orchestrator.dispatch(next);
+        assert.equal(
+          (yield* projections.getTeamPlan(threadId))?.latestReport?.generation,
+          current.generation,
+        );
+      }
+      // Archive/delete own cleanup effects already exist; the report must add none.
+      yield* assertNoExecution(threadId, command.commandId, before.effects.length);
+    }).pipe(Effect.provide(layerTest)),
+);
 
 it.effect("persists plan edits and priority changes without effects or new runs", () =>
   Effect.gen(function* () {
@@ -1114,7 +1318,7 @@ it.effect("accepts only one concurrent patch against the same persisted version"
 );
 
 it.effect(
-  "requires a user to confirm the plan or task and keeps confirmation free of execution",
+  "requires a user to confirm or schedule reports and keeps controls free of execution",
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1129,6 +1333,8 @@ it.effect(
       const operations: ReadonlyArray<TeamPlanOperation> = [
         { type: "confirm_plan", revision: draft.revision },
         { type: "confirm_task", taskId: "readme", revision: 1 },
+        { type: "set_report_schedule", enabled: true, everyMs: MIN_TEAM_PLAN_REPORT_INTERVAL_MS },
+        { type: "set_report_schedule", enabled: false, everyMs: MIN_TEAM_PLAN_REPORT_INTERVAL_MS },
       ];
       for (const [index, operation] of operations.entries()) {
         const refused = patch(threadId, `agent-confirm:${index}`, 1, [operation], "agent");
@@ -1145,7 +1351,34 @@ it.effect(
       assert.equal(confirmed?.version, 2);
       assert.equal(confirmed?.confirmedRevision, draft.revision);
       assert.isTrue(confirmed?.tasks.every((task) => task.confirmedRevision === task.revision));
+      if (confirmed === null) return yield* Effect.die("Missing confirmed synthetic plan");
+      const enable = patch(threadId, "user-report-schedule", confirmed.version, [operations[2]!]);
+      yield* orchestrator.dispatch(enable);
+      const scheduled = yield* projections.getTeamPlan(threadId);
+      assert.equal(scheduled?.version, confirmed.version + 1);
+      assert.equal(scheduled?.revision, confirmed.revision);
+      assert.equal(scheduled?.confirmedRevision, confirmed.confirmedRevision);
+      assert.deepEqual(scheduled?.tasks, confirmed.tasks);
+      assert.deepEqual(scheduled?.reportSchedule, {
+        enabled: true,
+        everyMs: MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
+        generation: 1,
+        nextReportAt: DateTime.formatIso(
+          DateTime.add(yield* DateTime.now, { milliseconds: MIN_TEAM_PLAN_REPORT_INTERVAL_MS }),
+        ),
+      });
+      const stale = patch(threadId, "stale-report-schedule", confirmed.version, [operations[3]!]);
+      const conflict = yield* orchestrator.dispatch(stale).pipe(Effect.result);
+      assert.isTrue(Result.isFailure(conflict));
+      if (Result.isFailure(conflict)) {
+        assert.instanceOf(conflict.failure, Orchestrator.OrchestratorTeamPlanPatchError);
+        if (conflict.failure._tag === "OrchestratorTeamPlanPatchError")
+          assert.equal(conflict.failure.reason, "version-conflict");
+      }
+      assert.deepEqual(yield* projections.getTeamPlan(threadId), scheduled);
       yield* assertNoExecution(threadId, initial.commandId);
       yield* assertNoExecution(threadId, confirm.commandId);
+      yield* assertNoExecution(threadId, enable.commandId);
+      yield* assertNoExecution(threadId, stale.commandId);
     }).pipe(Effect.provide(layerTest)),
 );

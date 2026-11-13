@@ -1,6 +1,11 @@
 import * as Schema from "effect/Schema";
 import { IsoDateTime, NodeId, RunId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import {
+  MIN_TEAM_PLAN_REPORT_INTERVAL_MS,
+  TeamPlanLatestReport,
+  TeamPlanReportSchedule,
+} from "./teamPlanReport.ts";
 
 const Revision = Schema.Int.check(Schema.isGreaterThan(0));
 const PlanVersion = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
@@ -65,6 +70,14 @@ export const TeamPlanTask = Schema.Struct({
   history: Schema.Array(TeamPlanTaskRevision),
 });
 export type TeamPlanTask = typeof TeamPlanTask.Type;
+const DispatchLimit = Schema.NullOr(
+  Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+);
+export const TeamPlanDispatchLimits = Schema.Struct({
+  maxConcurrentTasks: DispatchLimit,
+  maxTaskExecutions: DispatchLimit,
+});
+export type TeamPlanDispatchLimits = typeof TeamPlanDispatchLimits.Type;
 export const TeamPlan = Schema.Struct({
   threadId: ThreadId,
   version: PlanVersion,
@@ -72,6 +85,9 @@ export const TeamPlan = Schema.Struct({
   goal: Schema.String,
   confirmedRevision: Schema.NullOr(Revision),
   dispatchPaused: Schema.optionalKey(Schema.Boolean),
+  dispatchLimits: Schema.optionalKey(TeamPlanDispatchLimits),
+  reportSchedule: Schema.optionalKey(TeamPlanReportSchedule),
+  latestReport: Schema.optionalKey(TeamPlanLatestReport),
   tasks: Schema.Array(TeamPlanTask),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -110,6 +126,18 @@ const SetDispatchPaused = Schema.Struct({
   type: Schema.Literal("set_dispatch_paused"),
   paused: Schema.Boolean,
 });
+const SetDispatchLimits = Schema.Struct({
+  type: Schema.Literal("set_dispatch_limits"),
+  limits: TeamPlanDispatchLimits,
+});
+const SetReportSchedule = Schema.Struct({
+  type: Schema.Literal("set_report_schedule"),
+  enabled: Schema.Boolean,
+  everyMs: Schema.Int.check(
+    Schema.isGreaterThanOrEqualTo(MIN_TEAM_PLAN_REPORT_INTERVAL_MS),
+    Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+  ),
+});
 const BindExecution = Schema.Struct({
   type: Schema.Literal("bind_execution"),
   ...TeamPlanTaskRef.fields,
@@ -143,6 +171,8 @@ export const TeamPlanOperation = Schema.Union([
   ConfirmTask,
   BindExecution,
   SetDispatchPaused,
+  SetDispatchLimits,
+  SetReportSchedule,
   AcceptTask,
 ]);
 export type TeamPlanOperation = typeof TeamPlanOperation.Type;

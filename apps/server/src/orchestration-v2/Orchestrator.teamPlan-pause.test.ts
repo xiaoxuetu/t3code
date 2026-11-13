@@ -8,6 +8,9 @@ import {
   ProviderInstanceId,
   ThreadId,
   type OrchestrationV2Command,
+  type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
+  type TeamPlanExecutionRef,
   type TeamPlanOperation,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -39,7 +42,7 @@ const layerTest = Layer.mergeAll(
   ProviderReplayHarness.layerWithRegistry(
     { name: "team-plan-pause" },
     ProviderAdapterRegistry.layerFromAdapters([adapter]),
-    { databaseLayer: database, runEffectWorker: false },
+    { databaseLayer: database, runEffectWorker: false, runContinuationWorker: false },
   ),
 );
 
@@ -128,6 +131,7 @@ const setup = Effect.fn("TeamPlanPause.setup")(function* (
     const run = parent.runs[0]!;
     return (
       taskId: string,
+      revision = 1,
     ): Extract<OrchestrationV2Command, { type: "delegated_task.request" }> => ({
       type: "delegated_task.request",
       commandId: CommandId.make(`${owner}:request:${taskId}`),
@@ -136,19 +140,79 @@ const setup = Effect.fn("TeamPlanPause.setup")(function* (
       parentThreadId: owner,
       parentRunId: run.id,
       parentNodeId: run.rootNodeId!,
-      planTaskRef: { taskId, revision: 1 },
+      planTaskRef: { taskId, revision },
       task: "Caller text cannot replace the confirmed brief.",
       modelSelection: selection,
       runtimeMode: "approval-required",
       interactionMode: "default",
     });
   });
-  return { owner, getPlan, confirm, start };
+  const patch = (key: string, operations: readonly TeamPlanOperation[]) =>
+    getPlan.pipe(
+      Effect.flatMap((plan) =>
+        orchestrator.dispatch(planPatch(owner, key, plan.version, operations)),
+      ),
+    );
+  return { owner, getPlan, confirm, start, patch };
+});
+
+const setExecutionState = Effect.fn("TeamPlanPause.setExecutionState")(function* (
+  owner: ThreadId,
+  execution: TeamPlanExecutionRef,
+  key: string,
+  taskStatus: OrchestrationV2Subagent["status"],
+  runStatus: OrchestrationV2Run["status"],
+) {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const sink = yield* EventSink.EventSinkV2;
+  const parent = yield* store.getThreadRecords(owner, ["subagents"]);
+  const task = parent.subagents.find((candidate) => candidate.id === execution.subagentId)!;
+  const child = yield* store.getThreadRecords(execution.threadId, ["runs"]);
+  const run = child.runs.find((candidate) => candidate.id === execution.runId)!;
+  const now = yield* DateTime.now;
+  // Seed a persisted control-state combination without the live terminal listener normalizing it.
+  // Runtime reconciliation and existing control-read fixtures use this same event-source marker.
+  yield* sink.write({
+    commandId: CommandId.make(`command:runtime-reconcile:${owner}:${key}`),
+    events: [
+      {
+        id: EventId.make(`${owner}:${key}:task`),
+        type: "subagent.updated",
+        threadId: owner,
+        occurredAt: now,
+        payload: { ...task, status: taskStatus },
+      },
+      {
+        id: EventId.make(`${owner}:${key}:run`),
+        type: "run.updated",
+        threadId: execution.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: runStatus },
+      },
+    ],
+  });
+  return run;
+});
+
+const refuseDispatch = Effect.fn("TeamPlanPause.refuseDispatch")(function* (
+  command: Extract<OrchestrationV2Command, { type: "delegated_task.request" }>,
+  reason: string,
+) {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const outcome = yield* orchestrator.dispatch(command).pipe(Effect.result);
+  assert.isTrue(Result.isFailure(outcome), `Expected dispatch refusal: ${reason}`);
+  if (Result.isFailure(outcome)) {
+    assert.instanceOf(outcome.failure, Orchestrator.OrchestratorTeamPlanPatchError);
+    if (outcome.failure._tag === "OrchestratorTeamPlanPatchError")
+      assert.equal(outcome.failure.reason, reason);
+  }
 });
 
 const executionSnapshot = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   return yield* Effect.all({
+    threads: sql`SELECT thread_id FROM orchestration_v2_projection_threads ORDER BY thread_id`,
     runs: sql`SELECT run_id, payload_json FROM orchestration_v2_projection_runs ORDER BY run_id`,
     tasks: sql`SELECT subagent_id, payload_json FROM orchestration_v2_projection_subagents ORDER BY subagent_id`,
     effects: sql`SELECT effect_id, status, payload_json FROM orchestration_v2_effect_outbox ORDER BY effect_id`,
@@ -162,17 +226,23 @@ it.effect(
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const fixture = yield* setup("confirmation");
       const initial = yield* fixture.getPlan;
-      for (const paused of [true, false]) {
+      for (const [key, operation] of [
+        ["pause", { type: "set_dispatch_paused", paused: true }],
+        ["resume", { type: "set_dispatch_paused", paused: false }],
+        [
+          "limit",
+          { type: "set_dispatch_limits", limits: { maxConcurrentTasks: 1, maxTaskExecutions: 2 } },
+        ],
+        [
+          "unlimit",
+          {
+            type: "set_dispatch_limits",
+            limits: { maxConcurrentTasks: null, maxTaskExecutions: null },
+          },
+        ],
+      ] as const) {
         const error = yield* orchestrator
-          .dispatch(
-            planPatch(
-              fixture.owner,
-              `agent:${paused}`,
-              initial.version,
-              [{ type: "set_dispatch_paused", paused }],
-              "agent",
-            ),
-          )
+          .dispatch(planPatch(fixture.owner, `agent:${key}`, initial.version, [operation], "agent"))
           .pipe(Effect.flip);
         assert.instanceOf(error, Orchestrator.OrchestratorTeamPlanPatchError);
         if (error._tag === "OrchestratorTeamPlanPatchError")
@@ -233,6 +303,292 @@ it.effect(
       if (emptyResume._tag === "OrchestratorTeamPlanPatchError")
         assert.equal(emptyResume.reason, "plan-confirmation-required");
       assert.deepEqual(yield* empty.getPlan, emptyPlan);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "linearizes dispatch limits before creating a child and preserves committed recovery",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const fixture = yield* setup("dispatch-limit-race");
+      yield* fixture.confirm;
+      const confirmed = yield* fixture.getPlan;
+      yield* orchestrator.dispatch(
+        planPatch(fixture.owner, "limits", confirmed.version, [
+          {
+            type: "set_dispatch_limits",
+            limits: { maxConcurrentTasks: 1, maxTaskExecutions: null },
+          },
+        ]),
+      );
+      const request = yield* fixture.start;
+      const before = yield* executionSnapshot;
+      const outcomes = yield* Effect.forEach(
+        ["A", "B"],
+        (taskId) => orchestrator.dispatch(request(taskId)).pipe(Effect.result),
+        { concurrency: "unbounded" },
+      );
+      const successes = outcomes.filter(Result.isSuccess);
+      const failures = outcomes.filter(Result.isFailure);
+      assert.lengthOf(successes, 1);
+      assert.lengthOf(failures, 1);
+      const error = failures[0]!.failure;
+      assert.instanceOf(error, Orchestrator.OrchestratorTeamPlanPatchError);
+      if (error._tag === "OrchestratorTeamPlanPatchError")
+        assert.equal(error.reason, "concurrent-task-limit");
+      const plan = yield* fixture.getPlan;
+      const executions = plan.tasks.flatMap((task) => task.executions);
+      assert.lengthOf(executions, 1);
+      const after = yield* executionSnapshot;
+      assert.lengthOf(after.threads, before.threads.length + 1);
+      assert.lengthOf(after.runs, before.runs.length + 1);
+      assert.lengthOf(after.tasks, before.tasks.length + 1);
+      assert.lengthOf(after.effects, before.effects.length + 1);
+      const winner = plan.tasks.find((task) => task.executions.length === 1)!;
+      yield* fixture.patch("exhaust-total-too", [
+        { type: "set_dispatch_limits", limits: { maxConcurrentTasks: 1, maxTaskExecutions: 1 } },
+      ]);
+      const exhausted = yield* fixture.getPlan;
+      const retried = yield* orchestrator.dispatch({
+        ...request(winner.taskId),
+        commandId: CommandId.make(`${fixture.owner}:different-session-recovery`),
+      });
+      assert.isTrue(retried.replayed);
+      assert.deepEqual(
+        retried.storedEvents.map((stored) => [stored.sequence, stored.commandId, stored.event.id]),
+        successes[0]!.success.storedEvents.map((stored) => [
+          stored.sequence,
+          stored.commandId,
+          stored.event.id,
+        ]),
+      );
+      assert.deepEqual(yield* executionSnapshot, after);
+      assert.deepEqual(yield* fixture.getPlan, exhausted);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each([
+  { name: "pending-owned-task", task: "pending", run: "completed" },
+  { name: "waiting-owned-task", task: "waiting", run: "completed" },
+  { name: "queued-initial-run", task: "completed", run: "queued" },
+  { name: "waiting-initial-run", task: "completed", run: "waiting" },
+  { name: "unstarted-initial-run", task: "completed", run: "preparing" },
+  { name: "unknown-initial-run", task: "completed", run: null },
+] as const)("counts historical execution slots conservatively ($name)", (state) =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const fixture = yield* setup(`slot:${state.name}`);
+    yield* fixture.confirm;
+    const request = yield* fixture.start;
+    yield* orchestrator.dispatch(request("A"));
+    const first = yield* fixture.getPlan;
+    const execution = first.tasks.find((task) => task.taskId === "A")!.executions[0]!;
+    const initialRun = yield* setExecutionState(
+      fixture.owner,
+      execution,
+      "occupy",
+      state.task,
+      state.run ?? "preparing",
+    );
+    if (state.run === null) {
+      // An incomplete projection cannot prove that an initial run ended.
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`DELETE FROM orchestration_v2_projection_runs WHERE run_id = ${execution.runId}`;
+    }
+    yield* fixture.patch("archive-running-revision-and-limit", [
+      {
+        type: "edit_task",
+        taskId: "A",
+        changes: { prompt: "A revised scope must not hide the original live attempt." },
+      },
+      { type: "set_dispatch_limits", limits: { maxConcurrentTasks: 1, maxTaskExecutions: null } },
+    ]);
+    const revised = yield* fixture.getPlan;
+    yield* fixture.patch("confirm-new-scope", [
+      { type: "confirm_plan", revision: revised.revision },
+    ]);
+    const confirmed = yield* fixture.getPlan;
+    const seededParent = yield* store.getThreadRecords(fixture.owner, ["subagents"]);
+    assert.equal(
+      seededParent.subagents.find((task) => task.id === execution.subagentId)!.status,
+      state.task,
+    );
+    const seededChild = yield* store.getThreadRecords(execution.threadId, ["runs"]);
+    assert.equal(
+      seededChild.runs.find((run) => run.id === execution.runId)?.status ?? null,
+      state.run,
+    );
+    assert.lengthOf(confirmed.tasks.find((task) => task.taskId === "A")!.executions, 0);
+    assert.deepEqual(confirmed.tasks.find((task) => task.taskId === "A")!.history[0]!.executions, [
+      execution,
+    ]);
+    const before = yield* executionSnapshot;
+    yield* refuseDispatch(
+      request("B"),
+      state.run === null ? "execution-not-owned" : "concurrent-task-limit",
+    );
+    assert.deepEqual(yield* executionSnapshot, before);
+    assert.deepEqual(yield* fixture.getPlan, confirmed);
+    if (state.run === null) {
+      const sink = yield* EventSink.EventSinkV2;
+      yield* sink.write({
+        commandId: CommandId.make(`command:runtime-reconcile:${fixture.owner}:restore-run`),
+        events: [
+          {
+            id: EventId.make(`${fixture.owner}:restore-run`),
+            type: "run.updated",
+            threadId: execution.threadId,
+            runId: initialRun.id,
+            occurredAt: yield* DateTime.now,
+            payload: initialRun,
+          },
+        ],
+      });
+    }
+    yield* setExecutionState(fixture.owner, execution, "terminal", "completed", "completed");
+    yield* orchestrator.dispatch(request("B"));
+    const parent = yield* store.getThreadRecords(fixture.owner, ["subagents"]);
+    assert.lengthOf(parent.subagents, 2);
+    assert.lengthOf(
+      (yield* fixture.getPlan).tasks.find((task) => task.taskId === "B")!.executions,
+      1,
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("lowers dispatch limits without preempting existing executions", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const fixture = yield* setup("lower-limit", ["A", "B", "C"]);
+    yield* fixture.confirm;
+    const request = yield* fixture.start;
+    yield* orchestrator.dispatch(request("A"));
+    yield* orchestrator.dispatch(request("B"));
+    const original = yield* fixture.getPlan;
+    const before = yield* executionSnapshot;
+    yield* fixture.patch("lower", [
+      { type: "set_dispatch_limits", limits: { maxConcurrentTasks: 1, maxTaskExecutions: null } },
+    ]);
+    const lowered = yield* fixture.getPlan;
+    assert.equal(lowered.revision, original.revision);
+    assert.equal(lowered.confirmedRevision, original.confirmedRevision);
+    assert.deepEqual(lowered.tasks, original.tasks);
+    assert.deepEqual(yield* executionSnapshot, before);
+    yield* refuseDispatch(request("C"), "concurrent-task-limit");
+    yield* setExecutionState(
+      fixture.owner,
+      original.tasks.find((task) => task.taskId === "A")!.executions[0]!,
+      "finish-A",
+      "completed",
+      "completed",
+    );
+    const oneRemains = yield* executionSnapshot;
+    yield* refuseDispatch(request("C"), "concurrent-task-limit");
+    assert.deepEqual(yield* executionSnapshot, oneRemains);
+    yield* setExecutionState(
+      fixture.owner,
+      original.tasks.find((task) => task.taskId === "B")!.executions[0]!,
+      "finish-B",
+      "completed",
+      "completed",
+    );
+    yield* orchestrator.dispatch(request("C"));
+    assert.lengthOf(
+      (yield* fixture.getPlan).tasks.find((task) => task.taskId === "C")!.executions,
+      1,
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "charges failed and cancelled history once and resumes only after a user raises the cap",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const fixture = yield* setup("execution-budget", ["A"]);
+      yield* fixture.confirm;
+      yield* fixture.patch("budget", [
+        { type: "set_dispatch_limits", limits: { maxConcurrentTasks: null, maxTaskExecutions: 2 } },
+      ]);
+      const request = yield* fixture.start;
+      for (const [index, status] of (["failed", "cancelled"] as const).entries()) {
+        const revision = index + 1;
+        const first = yield* orchestrator.dispatch(request("A", revision));
+        const plan = yield* fixture.getPlan;
+        const execution = plan.tasks[0]!.executions[0]!;
+        yield* setExecutionState(fixture.owner, execution, `terminal:${revision}`, status, status);
+        const beforeRecovery = yield* executionSnapshot;
+        const recovered = yield* orchestrator.dispatch({
+          ...request("A", revision),
+          commandId: CommandId.make(`${fixture.owner}:recover:${revision}`),
+        });
+        assert.isTrue(recovered.replayed);
+        assert.deepEqual(
+          recovered.storedEvents.map((stored) => [
+            stored.sequence,
+            stored.commandId,
+            stored.event.id,
+          ]),
+          first.storedEvents.map((stored) => [stored.sequence, stored.commandId, stored.event.id]),
+        );
+        assert.deepEqual(yield* executionSnapshot, beforeRecovery);
+        yield* fixture.patch(`revise:${revision}`, [
+          {
+            type: "edit_task",
+            taskId: "A",
+            changes: { prompt: `Explicitly requested new synthetic attempt ${revision + 1}.` },
+          },
+        ]);
+        const revised = yield* fixture.getPlan;
+        yield* fixture.patch(`confirm:${revision}`, [
+          { type: "confirm_plan", revision: revised.revision },
+        ]);
+      }
+      const exhausted = yield* fixture.getPlan;
+      assert.lengthOf(exhausted.tasks[0]!.history, 2);
+      assert.deepEqual(
+        exhausted.tasks[0]!.history.map((entry) => entry.executions.length),
+        [1, 1],
+      );
+      assert.lengthOf(exhausted.tasks[0]!.executions, 0);
+      const before = yield* executionSnapshot;
+      yield* refuseDispatch(request("A", 3), "task-execution-limit");
+      assert.deepEqual(yield* executionSnapshot, before);
+      assert.deepEqual(yield* fixture.getPlan, exhausted);
+      // Raising a budget is a CAS-protected control change, not a scope revision or a new run.
+      yield* fixture.patch("raise-budget", [
+        { type: "set_dispatch_limits", limits: { maxConcurrentTasks: null, maxTaskExecutions: 3 } },
+      ]);
+      const raised = yield* fixture.getPlan;
+      assert.equal(raised.revision, exhausted.revision);
+      assert.equal(raised.confirmedRevision, exhausted.confirmedRevision);
+      assert.deepEqual(raised.tasks, exhausted.tasks);
+      assert.deepEqual(yield* executionSnapshot, before);
+      const stale = yield* orchestrator
+        .dispatch(
+          planPatch(fixture.owner, "stale-budget", exhausted.version, [
+            {
+              type: "set_dispatch_limits",
+              limits: { maxConcurrentTasks: null, maxTaskExecutions: null },
+            },
+          ]),
+        )
+        .pipe(Effect.result);
+      assert.isTrue(Result.isFailure(stale));
+      if (Result.isFailure(stale)) {
+        assert.instanceOf(stale.failure, Orchestrator.OrchestratorTeamPlanPatchError);
+        if (stale.failure._tag === "OrchestratorTeamPlanPatchError")
+          assert.equal(stale.failure.reason, "version-conflict");
+      }
+      assert.deepEqual(yield* fixture.getPlan, raised);
+      assert.deepEqual(yield* executionSnapshot, before);
+      yield* orchestrator.dispatch(request("A", 3));
+      const continued = yield* fixture.getPlan;
+      assert.lengthOf(continued.tasks[0]!.executions, 1);
+      assert.deepEqual(continued.tasks[0]!.history, exhausted.tasks[0]!.history);
+      assert.lengthOf((yield* executionSnapshot).runs, before.runs.length + 1);
     }).pipe(Effect.provide(layerTest)),
 );
 

@@ -453,6 +453,8 @@ export class ProviderAdapterEventStreamError extends Schema.TaggedError<Provider
 const ProviderAdapterFailureReason = Schema.Literals([
   "previous_turn_active",
   "attachment_unreadable",
+  "invalid_item_identity",
+  "session_owner_mismatch",
 ]);
 export type ProviderAdapterFailureReason = typeof ProviderAdapterFailureReason.Type;
 
@@ -512,7 +514,9 @@ export interface ProviderAdapterV2OpenSessionInput {
   readonly promptSuggestions?: Effect.Effect<boolean>;
   readonly resumeFromSession?: OrchestrationV2ProviderSession;
   readonly initialNativeThreadId?: string;
-  readonly initialProviderItemIdentityVersion?: 2;
+  readonly initialProviderThreadId?: ProviderThreadId;
+  readonly initialProviderItemIdentityVersion?: 2 | 3;
+  readonly initialProviderItemIdentityScope?: string;
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {

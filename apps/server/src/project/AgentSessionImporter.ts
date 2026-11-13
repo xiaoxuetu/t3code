@@ -560,11 +560,15 @@ const make = Effect.gen(function* () {
           cwd: thread.worktreePath ?? input.workspaceRoot,
         },
         initialNativeThreadId: nativeThreadId,
+        initialProviderThreadId: providerThread.id,
         ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
           ? {}
           : {
               initialProviderItemIdentityVersion: providerThread.nativeMetadata.itemIdentityVersion,
             }),
+        ...(providerThread.nativeMetadata?.itemIdentityScope === undefined
+          ? {}
+          : { initialProviderItemIdentityScope: providerThread.nativeMetadata.itemIdentityScope }),
       })
       .pipe(
         Effect.flatMap((session) => session.readThreadSnapshot({ providerThread })),

@@ -18,6 +18,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  ProviderThreadId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -441,6 +442,16 @@ function unimplemented(detail: string) {
   );
 }
 
+type TestProviderOpenHints = Pick<
+  ProviderAdapter.ProviderAdapterV2OpenSessionInput,
+  | "threadId"
+  | "providerSessionId"
+  | "initialNativeThreadId"
+  | "initialProviderThreadId"
+  | "initialProviderItemIdentityVersion"
+  | "initialProviderItemIdentityScope"
+>;
+
 const makeProviderAdapter = Effect.fnUntraced(function* (
   state: Ref.Ref<TestProviderRuntimeState>,
   options: {
@@ -451,10 +462,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly mcpConfigs?: Ref.Ref<
       ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
     >;
-    readonly beforeOpen?: (input: {
-      readonly providerSessionId: ProviderSessionId;
-      readonly initialProviderItemIdentityVersion?: 2;
-    }) => Effect.Effect<void>;
+    readonly beforeOpen?: (input: TestProviderOpenHints) => Effect.Effect<void>;
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
@@ -624,10 +632,7 @@ function layerTest(input: {
   readonly mcpConfigs?: Ref.Ref<
     ReadonlyArray<McpProviderSession.McpProviderSessionConfig | undefined>
   >;
-  readonly beforeOpen?: (input: {
-    readonly providerSessionId: ProviderSessionId;
-    readonly initialProviderItemIdentityVersion?: 2;
-  }) => Effect.Effect<void>;
+  readonly beforeOpen?: (input: TestProviderOpenHints) => Effect.Effect<void>;
   readonly failReleaseEventWrites?: boolean;
   readonly flakyReleaseWrites?: FlakyReleaseWrites;
   readonly pauseAttachWrite?: Parameters<typeof layerPausingAttachEventSink>[0];
@@ -1018,8 +1023,28 @@ it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", ()
     const firstOpenStarted = yield* Deferred.make<void>();
     const secondOpenStarted = yield* Deferred.make<void>();
     const releaseOpens = yield* Deferred.make<void>();
-    const beforeOpen = () =>
+    const openedHints = yield* Ref.make<readonly TestProviderOpenHints[]>([]);
+    const beforeOpen = (input: TestProviderOpenHints) =>
       Effect.gen(function* () {
+        yield* Ref.update(openedHints, (current) => [
+          ...current,
+          {
+            threadId: input.threadId,
+            providerSessionId: input.providerSessionId,
+            ...(input.initialNativeThreadId === undefined
+              ? {}
+              : { initialNativeThreadId: input.initialNativeThreadId }),
+            ...(input.initialProviderThreadId === undefined
+              ? {}
+              : { initialProviderThreadId: input.initialProviderThreadId }),
+            ...(input.initialProviderItemIdentityVersion === undefined
+              ? {}
+              : { initialProviderItemIdentityVersion: input.initialProviderItemIdentityVersion }),
+            ...(input.initialProviderItemIdentityScope === undefined
+              ? {}
+              : { initialProviderItemIdentityScope: input.initialProviderItemIdentityScope }),
+          },
+        ]);
         const openNumber = yield* Ref.modify(openStartedCount, (count) => [count + 1, count + 1]);
         yield* Deferred.succeed(openNumber === 1 ? firstOpenStarted : secondOpenStarted, undefined);
         yield* Deferred.await(releaseOpens);
@@ -1047,10 +1072,72 @@ it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", ()
           yield* makeThreadCreatedEvent({ idAllocator, threadId: secondThreadId, now }),
         ],
       });
-      const firstFiber = yield* manager
-        .open({
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const persistedThreads = [
+        {
           threadId: firstThreadId,
           providerSessionId: firstProviderSessionId,
+          scope: "conversation-incarnation:A",
+          id: ProviderThreadId.make("provider-thread:concurrent:A"),
+        },
+        {
+          threadId: secondThreadId,
+          providerSessionId: secondProviderSessionId,
+          scope: "conversation-incarnation:B",
+          id: ProviderThreadId.make("provider-thread:concurrent:B"),
+        },
+      ];
+      for (const input of persistedThreads) {
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+              type: "provider-thread.updated",
+              threadId: input.threadId,
+              driver: CODEX_DRIVER,
+              occurredAt: now,
+              payload: {
+                ...makeProviderThread({
+                  idAllocator,
+                  threadId: input.threadId,
+                  providerSessionId: input.providerSessionId,
+                  now,
+                  nativeThreadId: "same-raw-native-session",
+                }),
+                id: input.id,
+                nativeMetadata: { itemIdentityVersion: 3, itemIdentityScope: input.scope },
+              },
+            },
+          ],
+        });
+      }
+      const persistedHints = yield* Effect.forEach(persistedThreads, (input) =>
+        projectionStore.getThreadProjection(input.threadId).pipe(
+          Effect.map((projection) => {
+            const thread = projection.providerThreads[0]!;
+            const nativeThreadId = thread.nativeThreadRef?.nativeId;
+            const identityVersion = thread.nativeMetadata?.itemIdentityVersion;
+            const identityScope = thread.nativeMetadata?.itemIdentityScope;
+            return {
+              threadId: input.threadId,
+              providerSessionId: input.providerSessionId,
+              initialProviderThreadId: thread.id,
+              ...(nativeThreadId === undefined || nativeThreadId === null
+                ? {}
+                : { initialNativeThreadId: nativeThreadId }),
+              ...(identityVersion === undefined
+                ? {}
+                : { initialProviderItemIdentityVersion: identityVersion }),
+              ...(identityScope === undefined
+                ? {}
+                : { initialProviderItemIdentityScope: identityScope }),
+            } satisfies TestProviderOpenHints;
+          }),
+        ),
+      );
+      const firstFiber = yield* manager
+        .open({
+          ...persistedHints[0]!,
           modelSelection,
           runtimePolicy,
         })
@@ -1058,8 +1145,7 @@ it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", ()
       yield* Deferred.await(firstOpenStarted);
       const secondFiber = yield* manager
         .open({
-          threadId: secondThreadId,
-          providerSessionId: secondProviderSessionId,
+          ...persistedHints[1]!,
           modelSelection,
           runtimePolicy,
         })
@@ -1074,6 +1160,11 @@ it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", ()
       ]);
       assert.notStrictEqual(firstRuntime, secondRuntime);
       assert.equal((yield* Ref.get(state)).openCount, 2);
+      assert.deepEqual(yield* Ref.get(openedHints), persistedHints);
+      assert.deepEqual(
+        persistedHints.map((input) => input.initialNativeThreadId),
+        ["same-raw-native-session", "same-raw-native-session"],
+      );
     });
 
     yield* effect.pipe(
@@ -4726,6 +4817,69 @@ it.effect.each([
             runtimePolicy: policy,
           });
           assert.equal((yield* Ref.get(state)).resumeCount, before + 1, `${name} did not reload`);
+        }
+
+        const scopedThread = {
+          ...secondProviderThread,
+          nativeMetadata: {
+            itemIdentityVersion: 3,
+            itemIdentityScope: "conversation-incarnation:A",
+          },
+        } satisfies OrchestrationV2ProviderThread;
+        const identityReloadCases = [
+          {
+            name: "internal provider thread id",
+            from: secondProviderThread,
+            to: {
+              ...secondProviderThread,
+              id: ProviderThreadId.make("provider-thread:shared-runtime:replacement"),
+            },
+          },
+          {
+            name: "legacy item identity version",
+            from: secondProviderThread,
+            to: { ...secondProviderThread, nativeMetadata: { itemIdentityVersion: 2 } },
+          },
+          {
+            name: "item identity v2 to v3",
+            from: { ...secondProviderThread, nativeMetadata: { itemIdentityVersion: 2 } },
+            to: scopedThread,
+          },
+          {
+            name: "conversation incarnation scope",
+            from: scopedThread,
+            to: {
+              ...scopedThread,
+              nativeMetadata: {
+                itemIdentityVersion: 3,
+                itemIdentityScope: "conversation-incarnation:B",
+              },
+            },
+          },
+        ] satisfies ReadonlyArray<{
+          name: string;
+          from: OrchestrationV2ProviderThread;
+          to: OrchestrationV2ProviderThread;
+        }>;
+        for (const { name, from, to } of identityReloadCases) {
+          const resume = (providerThread: OrchestrationV2ProviderThread) =>
+            secondRuntime.resumeThread({
+              providerThread,
+              threadId: secondThreadId,
+              modelSelection,
+              runtimePolicy,
+            });
+          yield* resume(from);
+          const before = (yield* Ref.get(state)).resumeCount;
+          assert.equal(to.nativeThreadRef?.nativeId, from.nativeThreadRef?.nativeId);
+          yield* resume(to);
+          assert.equal((yield* Ref.get(state)).resumeCount, before + 1, `${name} did not reload`);
+          yield* resume({ ...to });
+          assert.equal(
+            (yield* Ref.get(state)).resumeCount,
+            before + 1,
+            `${name} identical identity did not deduplicate`,
+          );
         }
 
         yield* manager.detach({ providerSessionId, threadId: firstThreadId });

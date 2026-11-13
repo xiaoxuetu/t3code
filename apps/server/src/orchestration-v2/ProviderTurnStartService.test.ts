@@ -49,7 +49,10 @@ import * as ContextHandoffService from "./ContextHandoffService.ts";
 import { withInlineContext } from "./ContextHandoffDelivery.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import {
+  buildCodexTurnStartParams,
+  CodexProviderCapabilitiesV2,
+} from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -819,37 +822,38 @@ function makeLocalCommandHarness(input: {
     forkThread,
     startTurn,
   };
-  const open = vi.fn(() =>
-    input.sideChat !== undefined
-      ? Effect.succeed(sideChatSession as never)
-      : input.interruptOpen === true
-        ? Effect.interrupt
-        : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
-          ? Effect.succeed(resumeFallbackSession as never)
-          : "ensureThreadFailure" in input
-            ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
-            : "openFailure" in input
-              ? Effect.sync(() => {
-                  if (input.interruptRunBeforeOpenFailure === true) interruptRun();
-                }).pipe(
-                  Effect.andThen(
-                    Effect.fail(
-                      new ProviderSessionManager.ProviderSessionOpenError({
-                        instanceId: newInstanceId,
-                        providerSessionId,
-                        cause: input.openFailure,
-                      }),
+  const open = vi.fn(
+    (_request?: Parameters<ProviderSessionManager.ProviderSessionManagerV2Shape["open"]>[0]) =>
+      input.sideChat !== undefined
+        ? Effect.succeed(sideChatSession as never)
+        : input.interruptOpen === true
+          ? Effect.interrupt
+          : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
+            ? Effect.succeed(resumeFallbackSession as never)
+            : "ensureThreadFailure" in input
+              ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
+              : "openFailure" in input
+                ? Effect.sync(() => {
+                    if (input.interruptRunBeforeOpenFailure === true) interruptRun();
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new ProviderSessionManager.ProviderSessionOpenError({
+                          instanceId: newInstanceId,
+                          providerSessionId,
+                          cause: input.openFailure,
+                        }),
+                      ),
                     ),
-                  ),
-                )
-              : input.failReadsAfterRunning === true || input.previousTurn !== undefined
-                ? Effect.succeed({
-                    driver: providerThread.driver,
-                    providerSession,
-                    ensureThread: () => Effect.succeed(providerThread),
-                    resumeThread: () => Effect.succeed(projection.providerThreads[0]),
-                  } as never)
-                : Effect.die("A local command must not open a native session."),
+                  )
+                : input.failReadsAfterRunning === true || input.previousTurn !== undefined
+                  ? Effect.succeed({
+                      driver: providerThread.driver,
+                      providerSession,
+                      ensureThread: () => Effect.succeed(providerThread),
+                      resumeThread: () => Effect.succeed(projection.providerThreads[0]),
+                    } as never)
+                  : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<
     (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) => Effect.Effect<void>
@@ -1466,6 +1470,189 @@ effectIt.effect.each([
           delivery: { nativeThreadId: "side-chat-native", status: "inline" },
         },
       ]);
+    }),
+);
+
+effectIt.effect.each([
+  { version: undefined, scope: undefined, nativeId: "shared-native" },
+  { version: 2, scope: undefined, nativeId: "shared-native" },
+  { version: 3, scope: "persisted-scope", nativeId: "shared-native" },
+  { version: 3, scope: "persisted-scope", nativeId: undefined },
+] as const)("passes persisted provider identity before opening its runtime: %j", (identity) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      sideChat: { contextRun: "current" },
+    });
+    const projection = harness.projection();
+    const stored = projection.providerThreads[0]!;
+    harness.setProjection({
+      ...projection,
+      providerThreads: [
+        {
+          ...stored,
+          nativeThreadRef:
+            identity.nativeId === undefined
+              ? null
+              : {
+                  driver: stored.driver,
+                  nativeId: identity.nativeId,
+                  strength: "strong",
+                },
+          nativeMetadata:
+            identity.version === undefined
+              ? null
+              : {
+                  itemIdentityVersion: identity.version,
+                  ...(identity.scope === undefined ? {} : { itemIdentityScope: identity.scope }),
+                },
+        },
+      ],
+    });
+    yield* harness.start;
+    const opened = harness.open.mock.calls[0]?.[0];
+    expect(opened).toMatchObject({ initialProviderThreadId: stored.id });
+    expect(opened).toBeDefined();
+    if (opened === undefined) return;
+    expect(opened.initialNativeThreadId).toBe(identity.nativeId);
+    expect(opened.initialProviderItemIdentityVersion).toBe(identity.version);
+    expect(opened.initialProviderItemIdentityScope).toBe(identity.scope);
+    if (identity.version === undefined)
+      expect(opened).not.toHaveProperty("initialProviderItemIdentityVersion");
+    if (identity.scope === undefined)
+      expect(opened).not.toHaveProperty("initialProviderItemIdentityScope");
+  }),
+);
+
+effectIt.effect.each([true, false])(
+  "preserves handoff delivery for a future Codex effort advertised=%s",
+  (advertised) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        sideChat: { contextRun: "current" },
+      });
+      const projection = harness.projection();
+      const { sideChat: _sideChat, ...lineage } = projection.thread.lineage;
+      harness.setProjection({ ...projection, thread: { ...projection.thread, lineage } });
+      const prepared: string[] = [];
+      harness.startTurn.mockImplementation(
+        (turn) =>
+          buildCodexTurnStartParams({
+            nativeThreadId: "synthetic-native",
+            codexInput: [{ type: "text", text: turn.message.text }],
+            runtimePolicy: {
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd: null,
+              selectionPolicy: "strict",
+            },
+            modelSelection: {
+              ...turn.modelSelection,
+              options: [{ id: "reasoningEffort", value: "future-effort" }],
+            },
+            models: [
+              {
+                slug: turn.modelSelection.model,
+                name: "Synthetic model",
+                isCustom: false,
+                capabilities: {
+                  optionDescriptors: [
+                    {
+                      id: "reasoningEffort",
+                      label: "Reasoning effort",
+                      type: "select",
+                      options: [
+                        { id: advertised ? "future-effort" : "high", label: "Available effort" },
+                      ],
+                    },
+                  ],
+                },
+              },
+            ],
+          }).pipe(
+            Effect.tap((params) =>
+              Effect.sync(() => void prepared.push(params.effort ?? "missing")),
+            ),
+            Effect.asVoid,
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: projection.providerThreads[0]!.driver,
+                  threadId: projection.thread.id,
+                  providerThreadId: projection.providerThreads[0]!.id,
+                  runId: projection.runs.at(-1)!.id,
+                  cause,
+                }),
+            ),
+          ) as never,
+      );
+      yield* harness.start.pipe(Effect.exit);
+      expect(harness.startTurn).toHaveBeenCalledOnce();
+      expect(prepared).toEqual(advertised ? ["future-effort"] : []);
+      expect(harness.projection().contextHandoffs[0]?.delivery?.status).toBe(
+        advertised ? "inline" : undefined,
+      );
+      expect(
+        harness.events.some(
+          (event) =>
+            event.type === "context-handoff.updated" &&
+            event.payload.delivery?.status === "pending",
+        ),
+      ).toBe(true);
+    }),
+);
+
+effectIt.effect.each([
+  { tag: "AcpConfigurationSelectionError", reason: undefined, unsent: true },
+  { tag: "CodexSelectionUnavailableError", reason: undefined, unsent: true },
+  { tag: "UnknownProviderError", reason: undefined, unsent: false },
+  { tag: "ProviderAdapterProtocolError", reason: "invalid_item_identity", unsent: true },
+  { tag: "ProviderAdapterProtocolError", reason: "session_owner_mismatch", unsent: true },
+  { tag: "ProviderAdapterProtocolError", reason: "previous_turn_active", unsent: false },
+] as const)(
+  "retains unsent inline handoffs only for a known pre-prompt refusal: %j",
+  ({ tag, reason, unsent }) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        sideChat: { contextRun: "current" },
+      });
+      const projection = harness.projection();
+      const { sideChat: _sideChat, ...lineage } = projection.thread.lineage;
+      harness.setProjection({ ...projection, thread: { ...projection.thread, lineage } });
+      const refusal =
+        reason === undefined
+          ? { _tag: tag, message: "Synthetic selection refusal." }
+          : new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: projection.providerThreads[0]!.driver,
+              reason,
+              detail: "Synthetic identity refusal.",
+            });
+      harness.startTurn.mockImplementation(
+        () =>
+          Effect.fail(
+            new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: projection.providerThreads[0]!.driver,
+              threadId: projection.thread.id,
+              providerThreadId: projection.providerThreads[0]!.id,
+              runId: projection.runs.at(-1)!.id,
+              cause: refusal,
+            }),
+          ) as never,
+      );
+      yield* harness.start.pipe(Effect.exit);
+      expect(harness.startTurn).toHaveBeenCalledOnce();
+      expect(
+        harness.events.some(
+          (event) =>
+            event.type === "context-handoff.updated" &&
+            event.payload.delivery?.status === "pending",
+        ),
+      ).toBe(true);
+      expect(harness.projection().contextHandoffs[0]?.delivery?.status).toBe(
+        unsent ? undefined : "pending",
+      );
     }),
 );
 

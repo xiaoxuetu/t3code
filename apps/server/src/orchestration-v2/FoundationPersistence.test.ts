@@ -12,8 +12,13 @@ import {
   type ModelSelection,
   NodeId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ExecutionNode,
+  type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   ProjectId,
@@ -60,6 +65,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import { LIVE_STREAM_MAX_ITEMS, LiveStreamBufferError } from "./LiveStreamBudget.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import { acpScopedNativeId } from "@t3tools/provider-acp/server/adapter";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
@@ -715,6 +721,433 @@ it.effect.each([false, true])("groups shutdown commits with rollback=%s", (fail)
     Effect.provideService(Statement.SpanPropagationEnabled, true),
   );
 });
+
+it.effect(
+  "persists scoped ACP employee identities through service reconstruction and event replay",
+  () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const ids = (yield* IdAllocator.IdAllocatorV2).derive;
+      const now = yield* DateTime.now;
+      const driver = ProviderDriverKind.make("acp-sql-fixture");
+      const instanceId = ProviderInstanceId.make("acp-sql-fixture");
+      const selection = { instanceId, model: "synthetic-model" };
+      const parentId = ThreadId.make("thread:foundation-acp-identities:parent");
+      const parentNodeId = NodeId.make("node:foundation-acp-identities:parent");
+      const nativeThreadId = "same-native-session";
+      const nativeTurnId = "same-native-turn";
+      const nativeMessageId = "same-native-message";
+      const workers = ["A", "B"].map((name) => {
+        const threadId = ThreadId.make(`thread:foundation-acp-identities:${name}`);
+        const subagentId = NodeId.make(`node:foundation-acp-identities:${name}`);
+        const identityScope = `conversation-incarnation:${name}`;
+        const runId = ids.run({ threadId, ordinal: 1 });
+        const attemptId = ids.runAttempt({ runId, attemptOrdinal: 1 });
+        const rootNodeId = ids.rootNode({ runId });
+        const nativeMessageKey = acpScopedNativeId(instanceId, nativeMessageId);
+        const providerThread: OrchestrationV2ProviderThread = {
+          id: ids.providerThread({
+            driver,
+            providerInstanceId: instanceId,
+            nativeThreadId,
+            identityScope,
+          }),
+          driver,
+          providerInstanceId: instanceId,
+          providerSessionId: ProviderSessionId.make(
+            `provider-session:foundation-acp-identities:${name}`,
+          ),
+          appThreadId: threadId,
+          ownerNodeId: null,
+          nativeThreadRef: { driver, nativeId: nativeThreadId, strength: "strong" },
+          nativeConversationHeadRef: null,
+          status: "active",
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          pendingBackgroundTasks: [],
+          contextUsage: null,
+          goal: null,
+          nativeMetadata: { itemIdentityVersion: 3, itemIdentityScope: identityScope },
+          createdAt: now,
+          updatedAt: now,
+        };
+        const turn: OrchestrationV2ProviderTurn = {
+          id: ids.providerTurn({
+            driver,
+            nativeTurnId: acpScopedNativeId(instanceId, nativeTurnId),
+            identityScope,
+          }),
+          providerThreadId: providerThread.id,
+          nodeId: rootNodeId,
+          runAttemptId: attemptId,
+          nativeTurnRef: { driver, nativeId: nativeTurnId, strength: "strong" },
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        };
+        const run: OrchestrationV2Run = {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId: instanceId,
+          modelSelection: selection,
+          providerThreadId: providerThread.id,
+          userMessageId: MessageId.make(`message:foundation-acp-identities:input:${name}`),
+          rootNodeId,
+          activeAttemptId: attemptId,
+          status: "running",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+          delegatedTaskId: subagentId,
+        };
+        const node: OrchestrationV2ExecutionNode = {
+          id: ids.nodeFromProviderItem({ driver, nativeItemId: nativeMessageKey, identityScope }),
+          threadId,
+          runId,
+          parentNodeId: rootNodeId,
+          rootNodeId,
+          kind: "assistant_message",
+          status: "running",
+          countsForRun: true,
+          providerThreadId: providerThread.id,
+          providerTurnId: turn.id,
+          nativeItemRef: { driver, nativeId: nativeMessageId, strength: "strong" },
+          runtimeRequestId: null,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        };
+        const message: OrchestrationV2ConversationMessage = {
+          id: ids.messageFromProviderItem({
+            driver,
+            nativeItemId: nativeMessageKey,
+            identityScope,
+          }),
+          threadId,
+          runId,
+          nodeId: node.id,
+          role: "assistant",
+          text: `Employee ${name} only`,
+          attachments: [],
+          streaming: true,
+          createdBy: "agent",
+          creationSource: "provider",
+          createdAt: now,
+          updatedAt: now,
+        };
+        const item: Extract<OrchestrationV2TurnItem, { type: "assistant_message" }> = {
+          id: ids.turnItemFromProviderItem({
+            driver,
+            nativeItemId: nativeMessageKey,
+            identityScope,
+          }),
+          threadId,
+          runId,
+          nodeId: node.id,
+          providerThreadId: providerThread.id,
+          providerTurnId: turn.id,
+          nativeItemRef: node.nativeItemRef,
+          parentItemId: null,
+          ordinal: 1,
+          status: "running",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "assistant_message",
+          messageId: message.id,
+          text: message.text,
+          streaming: true,
+        };
+        const subagent: OrchestrationV2Subagent = {
+          id: subagentId,
+          threadId: parentId,
+          runId: null,
+          parentNodeId,
+          origin: "app_owned",
+          createdBy: "agent",
+          driver,
+          providerInstanceId: instanceId,
+          providerThreadId: providerThread.id,
+          childThreadId: threadId,
+          nativeTaskRef: null,
+          prompt: "Read synthetic inputs only",
+          title: name,
+          model: selection.model,
+          status: "running",
+          result: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+        };
+        const thread: OrchestrationV2AppThread = {
+          ...makeThread(threadId, now),
+          providerInstanceId: instanceId,
+          modelSelection: selection,
+          createdBy: "agent",
+          creationSource: "mcp",
+          projectId: ProjectId.make("project:foundation-acp-identities"),
+          lineage: {
+            parentThreadId: parentId,
+            rootThreadId: parentId,
+            relationshipToParent: "subagent",
+          },
+          forkedFrom: { type: "node", nodeId: subagentId },
+        };
+        return { name, thread, providerThread, turn, run, node, message, item, subagent };
+      });
+      const events: OrchestrationV2DomainEvent[] = [
+        threadCreatedEvent({
+          id: "event:foundation-acp-identities:parent",
+          thread: makeThread(parentId, now),
+          now,
+        }),
+      ];
+      for (const worker of workers) {
+        const event = {
+          threadId: worker.thread.id,
+          occurredAt: now,
+          driver,
+          providerInstanceId: instanceId,
+        };
+        const id = (kind: string) =>
+          EventId.make(`event:foundation-acp-identities:${worker.name}:${kind}`);
+        events.push(
+          {
+            ...threadCreatedEvent({ id: String(id("thread")), thread: worker.thread, now }),
+            providerInstanceId: instanceId,
+          },
+          {
+            ...event,
+            id: id("task"),
+            type: "subagent.updated",
+            threadId: parentId,
+            payload: worker.subagent,
+          },
+          {
+            ...event,
+            id: id("provider-thread"),
+            type: "provider-thread.updated",
+            payload: worker.providerThread,
+          },
+          { ...event, id: id("run"), type: "run.created", payload: worker.run },
+          {
+            ...event,
+            id: id("attempt"),
+            type: "run-attempt.updated",
+            payload: {
+              id: worker.turn.runAttemptId!,
+              runId: worker.run.id,
+              attemptOrdinal: 1,
+              rootNodeId: worker.run.rootNodeId!,
+              providerInstanceId: instanceId,
+              providerThreadId: worker.providerThread.id,
+              providerTurnId: worker.turn.id,
+              reason: "initial",
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+          { ...event, id: id("turn"), type: "provider-turn.updated", payload: worker.turn },
+          { ...event, id: id("node"), type: "node.updated", payload: worker.node },
+          { ...event, id: id("message"), type: "message.updated", payload: worker.message },
+          { ...event, id: id("item"), type: "turn-item.updated", payload: worker.item },
+        );
+      }
+      const seeded = yield* sink.write({ events });
+      const committedItems = new Map(
+        seeded.flatMap(({ event }) =>
+          event.type === "turn-item.updated" ? [[event.payload.id, event.payload] as const] : [],
+        ),
+      );
+      const readRows = Effect.all({
+        threads: sql<{
+          id: string;
+          thread_id: string;
+        }>`SELECT provider_thread_id AS id, thread_id FROM orchestration_v2_projection_provider_threads ORDER BY id`,
+        turns: sql<{
+          id: string;
+          thread_id: string;
+        }>`SELECT provider_turn_id AS id, thread_id FROM orchestration_v2_projection_provider_turns ORDER BY id`,
+        messages: sql<{
+          id: string;
+          thread_id: string;
+        }>`SELECT message_id AS id, thread_id FROM orchestration_v2_projection_messages ORDER BY id`,
+        nodes: sql<{
+          id: string;
+          thread_id: string;
+        }>`SELECT node_id AS id, thread_id FROM orchestration_v2_projection_nodes ORDER BY id`,
+        items: sql<{
+          id: string;
+          thread_id: string;
+        }>`SELECT turn_item_id AS id, thread_id FROM orchestration_v2_projection_turn_items ORDER BY id`,
+      });
+      const rows = yield* readRows;
+      for (const entries of Object.values(rows)) {
+        assert.lengthOf(entries, 2);
+        assert.deepEqual(
+          entries.map((entry) => entry.thread_id).toSorted(),
+          workers.map((worker) => worker.thread.id).toSorted(),
+        );
+      }
+      const readSnapshot = Effect.gen(function* () {
+        const projection = yield* ProjectionStore.ProjectionStoreV2;
+        const parent = yield* projection.getThreadProjection(parentId);
+        assert.deepEqual(
+          parent.subagents
+            .map((task) => [task.id, task.childThreadId, task.providerThreadId])
+            .toSorted(),
+          workers
+            .map((worker) => [worker.subagent.id, worker.thread.id, worker.providerThread.id])
+            .toSorted(),
+        );
+        return yield* Effect.forEach(workers, (worker) =>
+          projection.getThreadProjection(worker.thread.id),
+        );
+      });
+      const initial = yield* readSnapshot;
+      for (const [index, worker] of workers.entries()) {
+        const child = initial[index]!;
+        assert.equal(child.thread.activeProviderThreadId, worker.providerThread.id);
+        assert.deepEqual(child.providerThreads, [worker.providerThread]);
+        assert.deepEqual(child.providerTurns, [worker.turn]);
+        assert.deepEqual(child.messages, [worker.message]);
+        assert.deepEqual(child.nodes, [worker.node]);
+        const committedItem = committedItems.get(worker.item.id);
+        if (committedItem?.type !== "assistant_message")
+          return yield* Effect.die("The committed ACP item must be an assistant message.");
+        assert.deepEqual(child.turnItems, [committedItem]);
+        assert.equal(child.runs[0]!.providerThreadId, worker.providerThread.id);
+        assert.equal(child.attempts[0]!.providerTurnId, worker.turn.id);
+      }
+      const first = workers[0]!;
+      const updatedText = "Employee A updated without changing B";
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make("event:foundation-acp-identities:A:message-updated"),
+            type: "message.updated",
+            threadId: first.thread.id,
+            occurredAt: now,
+            payload: { ...first.message, text: updatedText },
+          },
+          {
+            id: EventId.make("event:foundation-acp-identities:A:item-updated"),
+            type: "turn-item.updated",
+            threadId: first.thread.id,
+            occurredAt: now,
+            payload: { ...first.item, text: updatedText },
+          },
+        ],
+      });
+      const persisted = yield* readSnapshot;
+      assert.equal(persisted[0]!.messages[0]!.text, updatedText);
+      assert.deepEqual(persisted[1], initial[1]);
+      assert.deepEqual(yield* readRows, rows);
+      const sequence = yield* sink.latestSequence();
+      const sameDatabase = Layer.succeed(SqlClient.SqlClient, sql);
+      const rebuiltStores = Layer.mergeAll(EventStore.layer, ProjectionStore.layer).pipe(
+        Layer.provideMerge(sameDatabase),
+      );
+      const rebuilt = Layer.mergeAll(
+        rebuiltStores,
+        EventSink.layer.pipe(Layer.provide(rebuiltStores)),
+        ProjectionReplay.layer.pipe(Layer.provide(rebuiltStores)),
+        IdAllocator.layer,
+      );
+      yield* Effect.gen(function* () {
+        const restartedStore = yield* ProjectionStore.ProjectionStoreV2;
+        assert.isFalse(restartedStore === store);
+        assert.deepEqual(yield* readSnapshot, persisted);
+        const replay = yield* ProjectionReplay.ProjectionReplay;
+        assert.isTrue((yield* replay.rebuild).valid);
+        assert.deepEqual(yield* readSnapshot, persisted);
+        assert.deepEqual(yield* readRows, rows);
+        const restartedSink = yield* EventSink.EventSinkV2;
+        assert.equal(yield* restartedSink.latestSequence(), sequence);
+        const restored = yield* restartedStore.getThreadProjection(first.thread.id);
+        const thread = restored.providerThreads[0]!;
+        const scope = thread.nativeMetadata?.itemIdentityScope;
+        if (scope === undefined || thread.nativeThreadRef === null)
+          return yield* Effect.die("Scoped ACP identity metadata was not persisted.");
+        const derive = (yield* IdAllocator.IdAllocatorV2).derive;
+        assert.equal(
+          derive.providerThread({
+            driver,
+            providerInstanceId: instanceId,
+            nativeThreadId: thread.nativeThreadRef.nativeId!,
+            identityScope: scope,
+          }),
+          thread.id,
+        );
+        const restoredKey = acpScopedNativeId(instanceId, nativeMessageId);
+        const messageId = derive.messageFromProviderItem({
+          driver,
+          nativeItemId: restoredKey,
+          identityScope: scope,
+        });
+        const itemId = derive.turnItemFromProviderItem({
+          driver,
+          nativeItemId: restoredKey,
+          identityScope: scope,
+        });
+        assert.equal(messageId, first.message.id);
+        assert.equal(itemId, first.item.id);
+        assert.equal(
+          derive.nodeFromProviderItem({ driver, nativeItemId: restoredKey, identityScope: scope }),
+          first.node.id,
+        );
+        assert.equal(
+          derive.providerTurn({
+            driver,
+            nativeTurnId: acpScopedNativeId(instanceId, nativeTurnId),
+            identityScope: scope,
+          }),
+          first.turn.id,
+        );
+        yield* restartedSink.write({
+          events: [
+            {
+              id: EventId.make("event:foundation-acp-identities:A:resumed-message"),
+              type: "message.updated",
+              threadId: first.thread.id,
+              occurredAt: now,
+              payload: {
+                ...restored.messages[0]!,
+                id: messageId,
+                text: "Employee A resumed its persisted identity",
+              },
+            },
+            {
+              id: EventId.make("event:foundation-acp-identities:A:resumed-item"),
+              type: "turn-item.updated",
+              threadId: first.thread.id,
+              occurredAt: now,
+              payload: {
+                ...first.item,
+                id: itemId,
+                text: "Employee A resumed its persisted identity",
+              },
+            },
+          ],
+        });
+        const resumed = yield* readSnapshot;
+        assert.equal(resumed[0]!.messages[0]!.text, "Employee A resumed its persisted identity");
+        assert.deepEqual(resumed[1], persisted[1]);
+        assert.deepEqual(yield* readRows, rows);
+        assert.equal(yield* restartedSink.latestSequence(), sequence + 2);
+      }).pipe(Effect.provide(Layer.fresh(rebuilt)));
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
+);
 
 it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
   it.effect("projects oversized tool bodies once before replay and live RPC retention", () =>

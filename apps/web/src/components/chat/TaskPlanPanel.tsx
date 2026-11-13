@@ -1,13 +1,18 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
+import { MIN_TEAM_PLAN_REPORT_INTERVAL_MS } from "@t3tools/contracts";
 import type {
   TeamPlan,
   TeamPlanAcceptanceStatus,
+  TeamPlanDispatchLimits,
   TeamPlanExecutionRef,
+  TeamPlanLatestReport,
   TeamPlanPatch,
+  TeamPlanReportSchedule,
   TeamPlanTask,
 } from "@t3tools/contracts";
-import { teamPlanTaskReadiness } from "@t3tools/shared/teamPlan";
+import { teamPlanExecutionCount, teamPlanTaskReadiness } from "@t3tools/shared/teamPlan";
+import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
@@ -21,9 +26,14 @@ import {
   selectTaskPlanDependency,
   taskPlanDraft,
   taskPlanDraftOperations,
+  taskPlanDispatchLimitsDraft,
+  taskPlanDispatchLimitsOperations,
+  taskPlanReportScheduleOperations,
+  taskPlanEditorSaveVersion,
   taskPlanDependencyLabel,
   taskPlanHistoricalExecutions,
   type TaskPlanDraft,
+  type TaskPlanDispatchLimitsDraft,
 } from "./TaskPlanPanel.logic";
 
 export interface TaskPlanPanelControls {
@@ -41,23 +51,32 @@ export interface TaskPlanPanelProps extends TaskPlanPanelControls {
   readonly plan: TeamPlan | null;
 }
 
-type Editor =
-  | { readonly kind: "goal"; readonly version: number; readonly value: string }
+type Editor = { readonly baseline: TeamPlan | null } & (
+  | { readonly kind: "goal"; readonly value: string }
   | {
       readonly kind: "task";
-      readonly version: number;
       readonly taskId: string;
       readonly original: TeamPlanTask | null;
       readonly draft: TaskPlanDraft;
     }
   | {
+      readonly kind: "limits";
+      readonly original: TeamPlanDispatchLimits | undefined;
+      readonly draft: TaskPlanDispatchLimitsDraft;
+    }
+  | {
+      readonly kind: "reports";
+      readonly original: TeamPlanReportSchedule | undefined;
+      readonly minutes: string;
+    }
+  | {
       readonly kind: "verdict";
-      readonly version: number;
       readonly taskId: string;
       readonly revision: number;
       readonly status: TeamPlanAcceptanceStatus;
       readonly note: string;
-    };
+    }
+);
 
 function PlanField(props: { readonly label: string; readonly children: ReactNode }) {
   return (
@@ -68,21 +87,104 @@ function PlanField(props: { readonly label: string; readonly children: ReactNode
   );
 }
 
-function PlanTime(props: { readonly label: string; readonly value: string | null }) {
+function PlanTime(props: {
+  readonly label: string;
+  readonly value: string | null;
+  readonly missingText?: string;
+}) {
   return (
     <p className="break-words text-2xs text-muted-foreground">
       {props.label}:{" "}
-      {props.value ? <time dateTime={props.value}>{props.value}</time> : "Not recorded"}
+      {props.value ? (
+        <time dateTime={props.value}>{props.value}</time>
+      ) : (
+        (props.missingText ?? "Not recorded")
+      )}
     </p>
+  );
+}
+
+function PlanReportSnapshot({ report }: { readonly report: TeamPlanLatestReport }) {
+  const current = report.tasks.filter((task) => task.current);
+  const historicalCount = report.tasks.length - current.length;
+  return (
+    <details data-plan-latest-report className="rounded-lg border border-border p-3">
+      <summary className="cursor-pointer text-xs font-medium">Latest status snapshot</summary>
+      <div className="mt-2 space-y-2">
+        <p className="text-2xs text-muted-foreground">
+          Saved observation, not live status. Plan r{report.planRevision} · version{" "}
+          {report.planVersion}
+        </p>
+        <PlanTime label="Observed at" value={report.observedAt} missingText="unknown" />
+        <PlanTime label="Scheduled for" value={report.dueAt} missingText="unknown" />
+        <p className="text-2xs text-muted-foreground">
+          Dispatch at observation: {report.dispatchPaused ? "paused" : "not paused"}
+        </p>
+        <ul aria-label="Snapshot tasks" className="m-0 list-none space-y-3 p-0">
+          {current.map((task) => (
+            <li key={task.taskId} className="space-y-1 border-t border-border pt-2">
+              <p className="text-xs font-medium">
+                {task.taskId} · r{task.revision} · {task.title}
+              </p>
+              <p className="text-xs">Role: {task.role}</p>
+              <p className="text-xs">Acceptance: {task.acceptance}</p>
+              {task.executions.length === 0 ? (
+                <p className="text-xs">Runtime: unknown (no recorded execution)</p>
+              ) : (
+                <ul aria-label={`Snapshot executions for ${task.taskId}`} className="space-y-2">
+                  {task.executions.map((execution) => (
+                    <li key={execution.subagentId} className="space-y-1 break-words text-2xs">
+                      <p>Runtime: {execution.status}</p>
+                      <p className="text-muted-foreground">
+                        Selected executor/model:{" "}
+                        {execution.modelSelection
+                          ? `${execution.modelSelection.instanceId} · ${execution.modelSelection.model}`
+                          : "unknown"}
+                      </p>
+                      {execution.unavailableReason ? (
+                        <p className="text-muted-foreground">
+                          Observation unavailable: {execution.unavailableReason}
+                        </p>
+                      ) : null}
+                      <PlanTime label="Started" value={execution.startedAt} missingText="unknown" />
+                      <PlanTime
+                        label="Finished (run)"
+                        value={execution.completedAt}
+                        missingText="unknown"
+                      />
+                      <p className="text-muted-foreground">
+                        Elapsed at observation:{" "}
+                        {execution.elapsedMs === null
+                          ? "unknown"
+                          : formatDuration(execution.elapsedMs)}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </li>
+          ))}
+        </ul>
+        {current.length === 0 ? (
+          <p className="text-2xs text-muted-foreground">No current tasks in this snapshot.</p>
+        ) : null}
+        <p className="text-2xs text-muted-foreground">
+          Historical task revisions in snapshot: {historicalCount}. A completed run is separate from
+          acceptance.
+        </p>
+      </div>
+    </details>
   );
 }
 
 export function TaskPlanPanel(props: TaskPlanPanelProps) {
   const { plan, canEdit } = props;
   const version = plan?.version ?? 0;
+  const reportSchedule = plan?.reportSchedule;
   const [editor, setEditor] = useState<Editor | null>(() =>
-    plan === null ? { kind: "goal", version: 0, value: "" } : null,
+    plan === null ? { kind: "goal", baseline: null, value: "" } : null,
   );
+  const saveVersion = editor === null ? null : taskPlanEditorSaveVersion(editor.baseline, plan);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [requested, setRequested] = useState(false);
@@ -107,19 +209,19 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
     return result.ok;
   };
   const save = () => {
-    if (editor === null) return;
+    if (editor === null || saveVersion === null) return;
     if (editor.kind === "goal") {
       const goal = editor.value.trim();
       if (!goal) {
         setError("Enter the team's goal.");
         return;
       }
-      if (editor.version === version && plan?.goal === goal) {
+      if (plan?.goal === goal) {
         setEditor(null);
         return;
       }
       void run("Saving goal", () =>
-        patch({ expectedPlanVersion: editor.version, operations: [{ type: "set_goal", goal }] }),
+        patch({ expectedPlanVersion: saveVersion, operations: [{ type: "set_goal", goal }] }),
       );
     } else if (editor.kind === "task") {
       const result = taskPlanDraftOperations(editor.taskId, editor.draft, editor.original);
@@ -132,12 +234,38 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
         return;
       }
       void run("Saving task", () =>
-        patch({ expectedPlanVersion: editor.version, operations: result.operations }),
+        patch({ expectedPlanVersion: saveVersion, operations: result.operations }),
+      );
+    } else if (editor.kind === "limits") {
+      const result = taskPlanDispatchLimitsOperations(editor.draft, editor.original);
+      if (!result.ok) {
+        setError(result.message);
+        return;
+      }
+      if (result.operations.length === 0) {
+        setEditor(null);
+        return;
+      }
+      void run("Saving dispatch limits", () =>
+        patch({ expectedPlanVersion: saveVersion, operations: result.operations }),
+      );
+    } else if (editor.kind === "reports") {
+      const result = taskPlanReportScheduleOperations(editor.minutes, editor.original);
+      if (!result.ok) {
+        setError(result.message);
+        return;
+      }
+      if (result.operations.length === 0) {
+        setEditor(null);
+        return;
+      }
+      void run("Saving report schedule", () =>
+        patch({ expectedPlanVersion: saveVersion, operations: result.operations }),
       );
     } else {
       void run("Saving review verdict", () =>
         patch({
-          expectedPlanVersion: editor.version,
+          expectedPlanVersion: saveVersion,
           operations: [
             {
               type: "accept_task",
@@ -178,6 +306,41 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                 Plan dispatch paused. New plan tasks will wait; employees already running continue.
               </p>
             ) : null}
+            <div data-plan-dispatch-limits className="space-y-1 text-2xs text-muted-foreground">
+              <p>Concurrent task limit: {plan.dispatchLimits?.maxConcurrentTasks ?? "Not set"}</p>
+              <p>
+                Task executions used: {teamPlanExecutionCount(plan)} · Total limit:{" "}
+                {plan.dispatchLimits?.maxTaskExecutions ?? "Not set"}
+              </p>
+              <p>
+                These limits cover initial employee tasks dispatched by this plan, not coordinator
+                turns, manual follow-ups, native tools, or money/token budgets.
+              </p>
+            </div>
+            <div data-plan-report-schedule className="space-y-1 text-2xs text-muted-foreground">
+              <p>
+                Status reports:{" "}
+                {plan.reportSchedule?.enabled
+                  ? `Every ${plan.reportSchedule.everyMs / MIN_TEAM_PLAN_REPORT_INTERVAL_MS} min`
+                  : "Off"}
+              </p>
+              {plan.reportSchedule?.enabled ? (
+                <PlanTime
+                  label="Next snapshot due"
+                  value={plan.reportSchedule.nextReportAt}
+                  missingText="unknown"
+                />
+              ) : null}
+              <p>
+                Passive snapshots appear here while the server is running. They do not call a model,
+                execute tasks, or send external notifications.
+              </p>
+            </div>
+            {plan.latestReport ? (
+              <PlanReportSnapshot report={plan.latestReport} />
+            ) : (
+              <p className="text-2xs text-muted-foreground">No status snapshot recorded.</p>
+            )}
             <PlanTime label="Plan created" value={plan.createdAt} />
             <div className="flex flex-wrap gap-2">
               {plan.dispatchPaused !== true ? (
@@ -201,7 +364,9 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                 variant="outline"
                 size="xs"
                 disabled={!editable || editor !== null}
-                onClick={() => setEditor({ kind: "goal", version, value: plan.goal })}
+                onClick={() =>
+                  setEditor({ kind: "goal", baseline: structuredClone(plan), value: plan.goal })
+                }
               >
                 Edit goal
               </Button>
@@ -212,7 +377,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                 onClick={() =>
                   setEditor({
                     kind: "task",
-                    version,
+                    baseline: structuredClone(plan),
                     taskId: nextTaskPlanKey(plan),
                     original: null,
                     draft: taskPlanDraft(),
@@ -221,6 +386,61 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
               >
                 Add task
               </Button>
+              <Button
+                variant="outline"
+                size="xs"
+                disabled={!editable || editor !== null}
+                onClick={() =>
+                  setEditor({
+                    kind: "limits",
+                    baseline: structuredClone(plan),
+                    original: plan.dispatchLimits,
+                    draft: taskPlanDispatchLimitsDraft(plan.dispatchLimits),
+                  })
+                }
+              >
+                Edit dispatch limits
+              </Button>
+              <Button
+                variant="outline"
+                size="xs"
+                disabled={!editable || editor !== null}
+                onClick={() =>
+                  setEditor({
+                    kind: "reports",
+                    baseline: structuredClone(plan),
+                    original: plan.reportSchedule,
+                    minutes: plan.reportSchedule
+                      ? String(plan.reportSchedule.everyMs / MIN_TEAM_PLAN_REPORT_INTERVAL_MS)
+                      : "",
+                  })
+                }
+              >
+                {plan.reportSchedule?.enabled ? "Edit report schedule" : "Schedule reports"}
+              </Button>
+              {reportSchedule?.enabled ? (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  disabled={!editable || editor !== null}
+                  onClick={() =>
+                    void run("Stopping reports", () =>
+                      patch({
+                        expectedPlanVersion: version,
+                        operations: [
+                          {
+                            type: "set_report_schedule",
+                            enabled: false,
+                            everyMs: reportSchedule.everyMs,
+                          },
+                        ],
+                      }),
+                    )
+                  }
+                >
+                  Stop reports
+                </Button>
+              ) : null}
               {props.onPrepare ? (
                 <Button
                   variant="outline"
@@ -288,7 +508,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
             variant="outline"
             size="xs"
             disabled={!editable}
-            onClick={() => setEditor({ kind: "goal", version, value: "" })}
+            onClick={() => setEditor({ kind: "goal", baseline: null, value: "" })}
           >
             Set team goal
           </Button>
@@ -316,7 +536,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
               save();
             }}
           >
-            {editor.version !== version ? (
+            {saveVersion === null ? (
               <p role="status" className="text-xs text-destructive">
                 The saved plan changed while this form was open. Your draft is kept; cancel and
                 reopen to use the latest revision.
@@ -337,7 +557,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                 {(plan?.tasks.length ?? 0) === 0 && props.onPrepare ? (
                   <Button
                     size="xs"
-                    disabled={!editable || !editor.value.trim() || editor.version !== version}
+                    disabled={!editable || !editor.value.trim() || saveVersion === null}
                     onClick={() =>
                       void run("Preparing team", async () => {
                         await props.onPrepare?.(editor.value.trim());
@@ -481,6 +701,70 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                   ) : null}
                 </fieldset>
               </>
+            ) : editor.kind === "limits" ? (
+              <>
+                <PlanField label="Concurrent task limit">
+                  <Input
+                    size="compact"
+                    type="text"
+                    inputMode="numeric"
+                    value={editor.draft.maxConcurrentTasks}
+                    placeholder="Not set"
+                    disabled={!editable}
+                    aria-label="Concurrent task limit"
+                    onChange={(event) =>
+                      setEditor({
+                        ...editor,
+                        draft: { ...editor.draft, maxConcurrentTasks: event.target.value },
+                      })
+                    }
+                  />
+                </PlanField>
+                <PlanField label="Total task executions">
+                  <Input
+                    size="compact"
+                    type="text"
+                    inputMode="numeric"
+                    value={editor.draft.maxTaskExecutions}
+                    placeholder="Not set"
+                    disabled={!editable}
+                    aria-label="Total task executions"
+                    onChange={(event) =>
+                      setEditor({
+                        ...editor,
+                        draft: { ...editor.draft, maxTaskExecutions: event.target.value },
+                      })
+                    }
+                  />
+                </PlanField>
+                <p className="text-2xs text-muted-foreground">
+                  Leave a field empty for no configured cap. Queued, waiting, and unknown-state
+                  employees count toward concurrency. Total executions include current and
+                  historical attempts, including failed or cancelled ones. Lowering either cap does
+                  not stop employees already dispatched.
+                </p>
+              </>
+            ) : editor.kind === "reports" ? (
+              <>
+                <PlanField label="Report interval (minutes)">
+                  <Input
+                    size="compact"
+                    type="text"
+                    inputMode="numeric"
+                    value={editor.minutes}
+                    placeholder="Enter minutes"
+                    disabled={!editable}
+                    aria-label="Report interval (minutes)"
+                    onChange={(event) => setEditor({ ...editor, minutes: event.target.value })}
+                  />
+                </PlanField>
+                <p className="text-2xs text-muted-foreground">
+                  Enter a positive whole number of minutes. Saving enables passive status snapshots
+                  in this Task plan. It does not ask the coordinator to report, start work, or send
+                  external notifications. Use Stop reports to disable future snapshots; the last
+                  saved snapshot remains available.
+                </p>
+              </>
             ) : (
               <>
                 <p className="text-xs font-medium">
@@ -519,8 +803,13 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
               </>
             )}
             <div className="flex flex-wrap gap-2">
-              <Button type="submit" size="xs" disabled={!editable || editor.version !== version}>
-                Save {editor.kind === "verdict" ? "verdict" : editor.kind}
+              <Button type="submit" size="xs" disabled={!editable || saveVersion === null}>
+                Save{" "}
+                {editor.kind === "limits"
+                  ? "dispatch limits"
+                  : editor.kind === "reports"
+                    ? "report schedule"
+                    : editor.kind}
               </Button>
               <Button
                 variant="ghost"
@@ -714,7 +1003,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                       onClick={() =>
                         setEditor({
                           kind: "task",
-                          version,
+                          baseline: structuredClone(plan),
                           taskId: task.taskId,
                           original: task,
                           draft: taskPlanDraft(task),
@@ -730,7 +1019,7 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
                       onClick={() =>
                         setEditor({
                           kind: "verdict",
-                          version,
+                          baseline: structuredClone(plan),
                           taskId: task.taskId,
                           revision: task.revision,
                           status: task.acceptance.status,

@@ -14,6 +14,8 @@ A Qoder account might offer Kimi models and an AGY account might offer Gemini mo
 
 Reports distinguish the selected model from the actual executed model when the provider reports it. A configured effort is shown only when its selected option is available; actual effort is known only if the provider reports it. Missing model or effort observations stay unknown. Discovery does not install a provider, sign in for you, or inspect credentials.
 
+Plan-linked Codex runs also verify the selected model and explicit options against the provider's current published catalog before sending the prompt. An unverified custom model entry cannot establish account access. Refresh the provider's available models when needed; an unavailable or unsupported selection blocks the run instead of silently substituting another model or effort.
+
 Once you have confirmed the goal and list, the coordinator assembles a temporary team automatically and creates child conversations for ready tasks. Each writer has a defined scope. Independent writers can use separate worktrees; they receive committed inputs, so tell the coordinator about any required uncommitted changes before dispatch.
 
 This workflow is explicit and opt-in. It supplies the bundled working conventions without installing pstack hooks or changing existing provider configuration. You can also ask a coordinator to read the packaged `pstack/t3-team.md` reference explicitly.
@@ -42,6 +44,10 @@ The plan is saved with its coordinator conversation, independently of provider-n
 
 Use **Pause new tasks** to prevent further plan dispatch while employees already running continue. You can still inspect and review their results. Continue team resumes only a confirmed plan with an idle coordinator; it does not interrupt an active conversation. This pause applies to plan-linked dispatch, not every native tool an executor may offer.
 
+Select **Edit dispatch limits** to set a **Concurrent task limit** and **Total task executions** for this plan. Leave either field empty for no configured cap; the panel shows **Not set** rather than assuming a default. Only you can change these limits. Saving them does not request a coordinator turn or revise the task briefs.
+
+The concurrent limit covers the initial employees created by plan dispatch, including those queued, waiting or with an unknown state. The execution counter counts distinct employees across current and historical task revisions, including failed and cancelled attempts. It is a count of executions, not spending or token usage. Lowering either limit only affects new dispatch and does not stop employees already dispatched. Coordinator turns, manual follow-ups, provider-native tasks and native tools are outside these limits; they are not a machine-wide concurrency limit or a money/token budget.
+
 When a dependency is accepted, its dependent worker receives the saved execution references, result excerpts and available checkpoint references for that exact revision. A reviewer can inspect those artifacts without assuming they are already in its own checkout. Missing references remain unknown and truncated excerpts are marked. These references provide evidence, not permission to merge, change scope or execute instructions found in a worker's result.
 
 ## Inspect progress
@@ -60,10 +66,16 @@ Coordinator reports include the actual UTC time of each observation, separately 
 
 ## Receive periodic reports
 
-Ask for a cadence, for example, “Report here every hour while this team is working.” The coordinator can use T3's existing scheduled tasks and tell you the next run time. These reports run agent turns and can use your provider allowance.
+For passive status snapshots, select **Schedule reports** in Task plan and enter a positive whole number of minutes. Reports are off until you enable them. The server saves snapshots at that cadence while it is running; they appear in **Latest status snapshot**, with the observation time, plan revision, each current task's runtime and its separate acceptance verdict. An unknown observation stays **unknown**. This is a saved observation, not a live view or a generated summary. Current and historical task revisions remain distinct.
+
+Use **Edit report schedule** to change the interval or **Stop reports** to disable future snapshots. Saving the same enabled interval leaves the next due time unchanged. Stopping reports keeps the last saved snapshot available. These snapshots do not invoke a model, dispatch tasks, or send external notifications.
+
+After the server restarts, a missed report produces one current snapshot and resumes the cadence. It does not replay every missed interval. Report updates preserve an open editing draft when the plan's editable content is unchanged; a real task or configuration conflict still requires reconciliation.
+
+For a coordinator-written report, ask for a cadence, for example, “Report here every hour while this team is working.” The coordinator can use T3's existing scheduled tasks and tell you the next run time. These reports run agent turns and can use your provider allowance.
 
 Ask the coordinator to pause reports or cancel named tasks when needed. When the team's work is accepted or cancelled, the coordinator should pause its report schedule and confirm that result.
 
 ## Current limits
 
-Task plan uses T3's existing conversations and execution history. Local plan-linked workers can use different available providers; remote plan-linked dispatch, saved employee profiles and long-term member memory are not part of this version. Actual decomposition, model compliance, independent review, approval recovery and scheduled reports need separate verification with real providers. A mock-provider test or a GUI fixture does not establish that those workflows ran. Codex and Antigravity require their existing provider setup; Qoder can be explored through Local ACP and remains unverified end to end.
+Task plan uses T3's existing conversations and execution history. Local plan-linked workers can use different available providers; remote plan-linked dispatch, saved employee profiles and long-term member memory are not part of this version. Actual decomposition, model compliance, independent review, approval recovery and coordinator-written scheduled reports need separate verification with real providers. A mock-provider test or a GUI fixture does not establish that those workflows ran. Codex and Antigravity require their existing provider setup; Qoder can be explored through Local ACP and remains unverified end to end.

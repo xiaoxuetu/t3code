@@ -11,6 +11,7 @@ import { expect, it } from "vite-plus/test";
 import {
   applyTeamPlanPatch,
   createTeamPlan,
+  teamPlanExecutionCount,
   teamPlanTaskCommandId,
   teamPlanTaskReadiness,
   validateTeamPlan,
@@ -82,6 +83,70 @@ it("pauses only new dispatch without changing confirmed scope, history or execut
   expect(plan.revision).toBe(before.revision);
   expect(plan.tasks).toEqual(before.tasks);
   expect(teamPlanTaskReadiness(plan, "T1")).toEqual({ ready: true, reason: null });
+  const resumed = structuredClone(plan);
+  plan = patch(plan, [
+    {
+      type: "set_dispatch_limits",
+      limits: { maxConcurrentTasks: 1, maxTaskExecutions: 1 },
+    },
+  ]);
+  expect(plan.version).toBe(resumed.version + 1);
+  expect(plan.revision).toBe(resumed.revision);
+  expect(plan.confirmedRevision).toBe(resumed.confirmedRevision);
+  expect(plan.tasks).toEqual(resumed.tasks);
+  expect(teamPlanExecutionCount(plan)).toBe(1);
+  expect(teamPlanTaskReadiness(plan, "T1")).toEqual({
+    ready: false,
+    reason: "task-execution-limit",
+  });
+});
+
+it("persists report generations without postponing an unchanged schedule or revising task scope", () => {
+  let plan = patch(initial(), [{ type: "add_task", task: draft("T1") }]);
+  plan = patch(plan, [{ type: "confirm_plan", revision: plan.revision }]);
+  const approved = structuredClone(plan);
+  plan = patch(plan, [{ type: "set_report_schedule", enabled: true, everyMs: 60_000 }]);
+  expect(plan.reportSchedule).toEqual({
+    enabled: true,
+    everyMs: 60_000,
+    generation: 1,
+    nextReportAt: "2026-11-13T00:01:00.000Z",
+  });
+  expect(plan.revision).toBe(approved.revision);
+  expect(plan.confirmedRevision).toBe(approved.confirmedRevision);
+  expect(plan.tasks).toEqual(approved.tasks);
+  const unchanged = applyTeamPlanPatch(
+    plan,
+    {
+      expectedPlanVersion: plan.version,
+      operations: [{ type: "set_report_schedule", enabled: true, everyMs: 60_000 }],
+    },
+    { threadId, now: "2026-11-13T00:10:00.000Z" },
+  );
+  expect(unchanged.ok).toBe(true);
+  if (!unchanged.ok) throw new Error(unchanged.error.code);
+  expect(unchanged.plan.reportSchedule).toEqual(plan.reportSchedule);
+  plan = patch(plan, [{ type: "set_report_schedule", enabled: false, everyMs: 60_000 }]);
+  expect(plan.reportSchedule).toMatchObject({ generation: 2, enabled: false, nextReportAt: null });
+  plan = patch(plan, [{ type: "set_report_schedule", enabled: true, everyMs: 120_000 }]);
+  expect(plan.reportSchedule).toMatchObject({
+    generation: 3,
+    enabled: true,
+    nextReportAt: "2026-11-13T00:02:00.000Z",
+  });
+  for (const everyMs of [59_999, Number.MAX_SAFE_INTEGER]) {
+    expect(
+      applyTeamPlanPatch(
+        plan,
+        {
+          expectedPlanVersion: plan.version,
+          operations: [{ type: "set_report_schedule", enabled: true, everyMs }],
+        },
+        { threadId, now },
+      ),
+    ).toEqual({ ok: false, error: { code: "invalid-operation" } });
+  }
+  expect(plan.reportSchedule?.generation).toBe(3);
 });
 
 it("uses plan-version CAS and leaves the prior state untouched", () => {

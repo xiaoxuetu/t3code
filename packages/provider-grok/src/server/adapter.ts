@@ -172,8 +172,10 @@ const registerGrokExitPlanModeExtensions = ({
     (method) =>
       runtime.handleExtRequest(method, XAiExitPlanModeRequest, (params) =>
         Effect.gen(function* () {
+          const nativeSessionId = "params" in params ? params.params.sessionId : params.sessionId;
           const fallback = yield* lastProposedPlanMarkdown;
           yield* captureProposedPlan({
+            nativeSessionId,
             planMarkdown: extractXAiExitPlanMarkdown(params, fallback),
           });
           return makeXAiExitPlanModeCapturedResponse();
@@ -197,6 +199,7 @@ const registerGrokAskUserQuestionExtensions = ({
         }));
         return requestUserInput(
           {
+            nativeSessionId: identity.sessionId,
             nativeItemId: `${identity.sessionId}:xai-question:${identity.toolCallId}`,
             nativeRequestId: identity.toolCallId,
             questions,
