@@ -91,6 +91,7 @@ export function withCreationProvenance(
     case "thread.fork":
     case "thread.merge_back":
     case "delegated_task.request":
+    case "thread.team-plan.patch":
       return { ...command, ...provenance };
     default:
       return command;
@@ -102,6 +103,9 @@ function existingThreadIdsForCommand(
 ): ReadonlyArray<ThreadId> {
   switch (command.type) {
     case "thread.create":
+      return [];
+    case "thread.team-plan.patch":
+      // An app-owned plan does not need the legacy conversation hydrated before editing.
       return [];
     // Read-state commands only rewrite the thread payload's visited/unread
     // watermark and open stats; they never touch messages, so they do not need the imported

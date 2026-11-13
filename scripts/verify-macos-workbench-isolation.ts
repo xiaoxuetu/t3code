@@ -24,7 +24,11 @@ import {
   renameFixtureThread,
 } from "./lib/desktop-fixture-ui.ts";
 
-const versions = { official: "0.1.9", workbench: "0.1.0-workbench.4" } as const;
+import {
+  DEFAULT_WORKBENCH_VERSION,
+  parseWorkbenchPreviewVersion,
+} from "./lib/mac-workbench-build-input.ts";
+
 const titles = {
   official: "Official coexistence fixture",
   workbench: "Workbench coexistence fixture",
@@ -33,7 +37,7 @@ const finalTitles = {
   official: "Official persisted fixture",
   workbench: "Workbench persisted fixture",
 } as const;
-type Kind = keyof typeof versions;
+type Kind = "official" | "workbench";
 type Tracked = {
   app: ElectronApplication;
   child: ReturnType<ElectronApplication["process"]>;
@@ -55,10 +59,12 @@ async function main() {
     options: {
       "official-executable": { type: "string" },
       "workbench-executable": { type: "string" },
+      "workbench-version": { type: "string", default: DEFAULT_WORKBENCH_VERSION },
       "artifacts-dir": { type: "string", default: "macos-isolation-validation" },
     },
   });
   const output = NodePath.resolve(values["artifacts-dir"]!);
+  const versions = { official: "0.1.9", workbench: DEFAULT_WORKBENCH_VERSION };
   const checks: Record<string, boolean | number> = {};
   let phase = "host-guard";
   let status = "failed";
@@ -182,6 +188,9 @@ async function main() {
         process.env.GITHUB_REPOSITORY === "xiaoxuetu/t3code",
       "unsupported-host",
     );
+    const workbenchVersion = parseWorkbenchPreviewVersion(values["workbench-version"]);
+    requireCheck(workbenchVersion !== null, "invalid-workbench-version");
+    versions.workbench = workbenchVersion;
     const home = NodeOS.homedir();
     requireCheck(home === "/Users/runner" && process.env.HOME === home, "unexpected-runner-home");
     const runnerTemp = process.env.RUNNER_TEMP;

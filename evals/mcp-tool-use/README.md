@@ -305,3 +305,19 @@ After the change, the first reference to a file is an absolute link. The remaini
 2. From `evals/`, run `pnpm mcp-tool-use:trim-capture <claude|codex> <capture.json> mcp-tool-use/templates/<claude|codex>.json.gz`. It keeps only what `run.ts` reads, and removes user instructions, the user's own skills and agents, account ids, and home paths.
 3. Read the output for user data before you commit it: `zcat <file> | less`.
 4. Run the full eval on the old and new templates, and compare.
+
+## Team coordinator cases
+
+`cases/team-coordinator.ndjson` guards the Workbench .5 automatic team acceptance requirements with authored Acme data: a coordinator saves a draft and waits for UI confirmation; a confirmed continuation requests two distinct task revisions through `planTaskRef`; an unconfirmed continuation cannot dispatch; a read-only child cannot approve or mutate the parent plan.
+
+Top-level cases use `setup.teamCoordinatorPrompt` with `phase`, `goal`, and optional `planVersion`. The runner calls the product's `buildTeamCoordinatorPrompt` in `apps/web/src/components/chat/teamCoordinatorPrompt.ts`, with `workflowText` read from this checkout's `integrations/pstack/t3-team.md`. They leave `prompt` empty; copying builder text into the case or applying a coordinator builder to a child is rejected. MCP tool descriptions and schemas still come from the real toolkits.
+
+Build the requests offline without loading an env file or local provider configuration:
+
+```sh
+node mcp-tool-use/run.ts --cases mcp-tool-use/cases/team-coordinator.ndjson --dry-run
+```
+
+Run that command from `evals/`. Do not use the package script for a credential-free check: it explicitly loads the repository `.env`. The dry-run branch returns before model key lookup and `proxyConfig()`.
+
+These cases use canned schema-compatible plan results and the runner's simulated delegation responses. They grade model tool-use attempts, confirmation boundaries, and task-reference identity, not server authorization, durable plan mutation, actual child execution, or runtime idempotency. No paid-model baseline or candidate runs have been performed for these cases. Dry-run success and grader unit tests do not establish model compliance.

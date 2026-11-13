@@ -4,6 +4,8 @@ import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { TeamTaskBoard } from "./TeamTaskBoard";
+import { useTeamPlanControls } from "./useTeamPlanControls";
+import { TaskPlanPanel, type TaskPlanPanelControls } from "./TaskPlanPanel";
 import { visibleDelegatedTeamTasks } from "./TeamTaskBoard.logic";
 import { SectionHeaderStatus } from "../ui/collapsible-section-header";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
@@ -428,9 +430,16 @@ export function ThreadRelationshipsPanel(props: {
   readonly threadId: ThreadId;
   readonly showLineage: boolean;
   readonly showSideChats: boolean;
+  readonly taskPlanControls?: TaskPlanPanelControls;
 }) {
   const ref = scopeThreadRef(props.environmentId, props.threadId);
   const projection = useThreadProjection(ref)?.projection ?? null;
+  const connectedTaskPlanControls = useTeamPlanControls({
+    environmentId: props.environmentId,
+    threadId: props.threadId,
+    projection,
+  });
+  const taskPlanControls = props.taskPlanControls ?? connectedTaskPlanControls;
   const providersByEnvironment = useEnvironmentProviders();
   const settings = useAtomValue(serverEnvironment.settingsValueAtom(props.environmentId));
   const relationshipShells = useThreadRelationshipShells(ref);
@@ -631,7 +640,12 @@ export function ThreadRelationshipsPanel(props: {
   const sideChatsVisible = props.showSideChats && sideChats.length > 0;
   const runningSideChats = sideChats.filter(({ edge }) => edge.status === "running").length;
 
-  if (!lineageVisible && !sideChatsVisible && teamTasks.length === 0) {
+  if (
+    !lineageVisible &&
+    !sideChatsVisible &&
+    teamTasks.length === 0 &&
+    !(props.showLineage && taskPlanControls !== undefined)
+  ) {
     return null;
   }
 
@@ -976,6 +990,13 @@ export function ThreadRelationshipsPanel(props: {
 
   return (
     <>
+      {props.showLineage && taskPlanControls && projection !== null ? (
+        <TaskPlanPanel
+          key={`plan:${scopedThreadKey(ref)}`}
+          plan={projection?.teamPlan ?? null}
+          {...taskPlanControls}
+        />
+      ) : null}
       <TeamTaskBoard
         key={scopedThreadKey(ref)}
         tasks={teamTasks}

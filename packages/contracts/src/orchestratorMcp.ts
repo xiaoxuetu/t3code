@@ -43,6 +43,7 @@ import {
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { TeamPlan, TeamPlanAgentOperation, TeamPlanTaskRef } from "./teamPlan.ts";
 
 const OrchestratorMcpPrompt = TrimmedNonEmptyString.check(Schema.isMaxLength(120_000));
 const OrchestratorMcpTitle = TrimmedNonEmptyString.check(Schema.isMaxLength(512));
@@ -55,6 +56,26 @@ export const OrchestratorMcpClientRequestId = TrimmedNonEmptyString.check(Schema
     ),
   )
   .annotate({ description: "Reuse it to retry the same call. A new call gets a new key." });
+
+export const OrchestratorMcpTeamPlanInput = Schema.Union([
+  Schema.Struct({ action: Schema.Literal("read") }),
+  Schema.Struct({
+    action: Schema.Literal("patch"),
+    expectedPlanVersion: NonNegativeInt,
+    operations: Schema.Array(TeamPlanAgentOperation).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(100),
+    ),
+    clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+  }),
+]);
+export type OrchestratorMcpTeamPlanInput = typeof OrchestratorMcpTeamPlanInput.Type;
+
+export const OrchestratorMcpTeamPlanResult = Schema.Struct({
+  threadId: ThreadId,
+  plan: Schema.NullOr(TeamPlan),
+});
+export type OrchestratorMcpTeamPlanResult = typeof OrchestratorMcpTeamPlanResult.Type;
 
 // OpenCode 1.15 serializes nested MCP union objects as JSON strings; decode that form at the boundary.
 const OrchestratorMcpScheduleFromJsonString = Schema.fromJsonString(
@@ -168,6 +189,7 @@ export type OrchestratorMcpTerminalDelegatedTaskStatus =
 
 export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   task: OrchestratorMcpPrompt,
+  planTaskRef: Schema.optional(TeamPlanTaskRef),
   target: Schema.optional(OrchestratorMcpTarget),
   title: Schema.optional(OrchestratorMcpTitle),
   role: Schema.optional(OrchestratorMcpTaskRole),
@@ -684,6 +706,7 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
     threadManagement: Schema.Boolean,
     incrementalThreadRead: Schema.Boolean,
     scheduledTasks: Schema.Boolean,
+    teamPlan: Schema.optional(Schema.Boolean),
     maxBatchThreads: Schema.Number,
   }),
 });

@@ -558,6 +558,10 @@
     "./speech": {
       "types": "./src/speech.ts",
       "import": "./src/speech.ts"
+    },
+    "./teamPlan": {
+      "types": "./src/teamPlan.ts",
+      "import": "./src/teamPlan.ts"
     }
   },
   "scripts": {

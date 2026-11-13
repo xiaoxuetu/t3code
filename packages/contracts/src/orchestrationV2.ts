@@ -44,6 +44,7 @@ import {
 import { AuthMcpClientAccess } from "./auth.ts";
 import { ChatAttachment } from "./chatAttachment.ts";
 import { ThreadGuestShare } from "./guestShare.ts";
+import { TeamPlan, TeamPlanPatch, TeamPlanTaskRef } from "./teamPlan.ts";
 import { StoredThreadTags, ThreadTag } from "./threadTags.ts";
 import { ThreadTitleRegenerationOutcome } from "./threadTitle.ts";
 import {
@@ -1937,6 +1938,11 @@ const OrchestrationV2EventBase = Schema.Struct({
 export const OrchestrationV2DomainEvent = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
+    type: Schema.Literal("team-plan.updated"),
+    payload: Schema.Struct({ threadId: ThreadId, plan: TeamPlan }),
+  }),
+  Schema.Struct({
+    ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("thread.created"),
     payload: OrchestrationV2AppThread,
   }),
@@ -2083,6 +2089,7 @@ export type OrchestrationV2DomainEvent = typeof OrchestrationV2DomainEvent.Type;
 
 export const OrchestrationV2ThreadProjection = Schema.Struct({
   thread: OrchestrationV2AppThread,
+  teamPlan: Schema.optional(Schema.NullOr(TeamPlan)),
   runs: Schema.Array(OrchestrationV2Run),
   attempts: Schema.Array(OrchestrationV2RunAttempt),
   nodes: Schema.Array(OrchestrationV2ExecutionNode),
@@ -2870,6 +2877,11 @@ const OrchestrationV2JsonEventBaseFields = {
 export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
+    type: Schema.Literal("team-plan.updated"),
+    payload: Schema.Struct({ threadId: ThreadId, plan: TeamPlan }),
+  }),
+  Schema.Struct({
+    ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("thread.created"),
     payload: OrchestrationV2AppThreadJson,
   }),
@@ -3015,6 +3027,13 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
 export type OrchestrationV2DomainEventJson = typeof OrchestrationV2DomainEventJson.Type;
 
 export const OrchestrationV2Command = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.team-plan.patch"),
+    ...OrchestrationV2CreationFields,
+    commandId: CommandId,
+    threadId: ThreadId,
+    ...TeamPlanPatch.fields,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
     commandId: CommandId,
@@ -3452,6 +3471,7 @@ export const OrchestrationV2Command = Schema.Union([
     parentThreadId: ThreadId,
     parentRunId: RunId,
     parentNodeId: NodeId,
+    planTaskRef: Schema.optional(TeamPlanTaskRef),
     task: TrimmedNonEmptyString,
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,

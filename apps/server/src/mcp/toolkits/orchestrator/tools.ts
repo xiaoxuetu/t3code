@@ -1,6 +1,8 @@
 import {
   OrchestratorMcpCapabilitiesInput,
   OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpTeamPlanInput,
+  OrchestratorMcpTeamPlanResult,
   OrchestrationV2StopWorkflowInput,
   OrchestratorMcpEnvironmentLinkInput,
   OrchestratorMcpEnvironmentLinkResult,
@@ -86,9 +88,22 @@ const OrchestratorCapabilitiesTool = Tool.make("orchestrator_capabilities", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true);
 
+const TeamPlanTool = Tool.make("team_plan", {
+  description:
+    "Read or patch this coordinator thread's durable task plan. Read first; patch with expectedPlanVersion. Only the user confirms in the UI. accept_task status accepted needs evidenced successful completed child work; issues/blocked may record unavailable, failed or not-started work with a concrete note. Repeating a bound planTaskRef recovers its execution; propose a new edit_task revision and wait for confirmation for a fresh attempt. Never confirm or bind yourself. No other thread's plan.",
+  parameters: OrchestratorMcpTeamPlanInput,
+  success: OrchestratorMcpTeamPlanResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Read or update this team's plan")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false);
+
 const DelegateTaskTool = Tool.make("delegate_task", {
   description:
-    "Start one child agent with only `task`. No parent history. Separate checkout or PR per child: `isolation:'worktree'`. Keep `taskId` for `task_status` and `task_cancel`. No secrets in `task`.",
+    "Start one child agent with only `task`. No parent history. If this conversation has a team plan, its confirmed ready planTaskRef is required and dispatched once; retrying that revision returns the same execution. A fresh attempt needs an explicit new task revision and user confirmation. Separate checkout or PR per child: isolation:'worktree'. Keep taskId for task_status/task_cancel. No secrets in task.",
   parameters: OrchestratorMcpDelegateTaskInput,
   success: OrchestratorMcpDelegateTaskResult,
   failure: OrchestratorMcpFailure,
@@ -358,6 +373,7 @@ const EnvironmentUnlinkTool = Tool.make("t3_environment_unlink", {
 
 export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
+  TeamPlanTool,
   DelegateTaskTool,
   TaskStatusTool,
   TaskCancelTool,

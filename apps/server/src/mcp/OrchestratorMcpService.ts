@@ -16,6 +16,8 @@ import {
   OrchestratorMcpFailure,
   type OrchestratorMcpCapabilitiesInput,
   type OrchestratorMcpCapabilitiesResult,
+  type OrchestratorMcpTeamPlanInput,
+  type OrchestratorMcpTeamPlanResult,
   type OrchestratorMcpModelOption,
   type OrchestratorMcpCreateThreadsInput,
   type OrchestratorMcpCreateThreadsResult,
@@ -70,6 +72,7 @@ import { getProviderOptionCurrentValue, withLegacyUltracodeEffort } from "@t3too
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
+import { teamPlanTaskCommandId } from "@t3tools/shared/teamPlan";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -102,6 +105,7 @@ import type {
 } from "../orchestration-v2/ProjectionStore.ts";
 import { delegatedTaskResultRun, runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import { OrchestratorTeamPlanPatchError } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
@@ -165,6 +169,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input?: OrchestratorMcpCapabilitiesInput,
   ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
+  readonly teamPlan: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpTeamPlanInput,
+  ) => Effect.Effect<OrchestratorMcpTeamPlanResult, OrchestratorMcpFailure>;
   readonly delegateTask: (
     scope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
@@ -230,12 +238,14 @@ export class OrchestratorMcpService extends Context.Service<
 >()("t3/mcp/OrchestratorMcpService") {}
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const isTeamPlanPatchError = Schema.is(OrchestratorTeamPlanPatchError);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
   return new OrchestratorMcpFailure({ code, message });
 }
 
 function threadManagementFailure(error: unknown): OrchestratorMcpFailure {
+  if (isTeamPlanPatchError(error)) return failure("invalid_request", error.message);
   if (!isThreadManagementError(error)) return failure("orchestration_error", errorMessage(error));
   switch (error._tag) {
     case "ThreadManagementThreadNotFoundError":
@@ -2513,9 +2523,47 @@ const make = Effect.gen(function* () {
           threadManagement: true,
           incrementalThreadRead: true,
           scheduledTasks: true,
+          teamPlan: true,
           maxBatchThreads: 20,
         },
       };
+    }),
+    teamPlan: Effect.fn("OrchestratorMcpService.teamPlan")(function* (callerScope, input) {
+      yield* requireCapability(callerScope);
+      const scope = yield* requireThreadScope(callerScope, "team_plan");
+      const threadId = scope.thread.threadId;
+      if (input.action === "patch") {
+        const parent = yield* loadCallerRecords(threadId, ["runs"]);
+        yield* assertLiveCaller(scope, parent);
+        const commandId = stableCommandId({
+          scope,
+          requestKey: yield* requestKey(input.clientRequestId),
+          operation: "team-plan-patch",
+        });
+        yield* threadManagement
+          .dispatch({
+            type: "thread.team-plan.patch",
+            threadId,
+            commandId,
+            createdBy: "agent",
+            creationSource: "mcp",
+            expectedPlanVersion: input.expectedPlanVersion,
+            operations: input.operations,
+          })
+          .pipe(Effect.mapError(threadManagementFailure));
+      }
+      const projection = yield* loadThreadRecords(threadId, ["teamPlan"]);
+      if (projection.thread.deletedAt !== null) {
+        return yield* failure("thread_not_found", `Thread ${threadId} was deleted.`);
+      }
+      const plan = projection.teamPlan ?? null;
+      if (plan !== null && plan.threadId !== threadId) {
+        return yield* failure(
+          "invalid_request",
+          "This plan does not belong to the calling thread.",
+        );
+      }
+      return { threadId, plan };
     }),
     delegateTask: Effect.fn("OrchestratorMcpService.delegateTask")(function* (callerScope, input) {
       const environmentId =
@@ -2525,6 +2573,13 @@ const make = Effect.gen(function* () {
       if (input.target !== undefined && environmentId !== undefined) {
         yield* requireCapability(callerScope);
         const scope = yield* requireThreadScope(callerScope, "delegate_task");
+        const parent = yield* loadThreadRecords(scope.thread.threadId, ["teamPlan"]);
+        if (input.planTaskRef !== undefined || parent.teamPlan != null) {
+          return yield* failure(
+            "invalid_request",
+            "A team plan task can only be delegated in its coordinator's environment.",
+          );
+        }
         // The task's child runs as an ordinary thread there; this thread keeps the task.
         const { taskId } = yield* remoteDelegation.delegate(scope, {
           ...input,
@@ -2559,11 +2614,10 @@ const make = Effect.gen(function* () {
       }
       const providers = yield* loadProviders;
       const key = yield* requestKey(input.clientRequestId);
-      const commandId = stableCommandId({
-        scope,
-        requestKey: key,
-        operation: "delegate-task",
-      });
+      const commandId =
+        input.planTaskRef === undefined
+          ? stableCommandId({ scope, requestKey: key, operation: "delegate-task" })
+          : teamPlanTaskCommandId(scope.thread.threadId, input.planTaskRef);
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
       const target = yield* resolveTargetRechecking({
         parent,
@@ -2623,6 +2677,7 @@ const make = Effect.gen(function* () {
           parentRunId: parentRun.id,
           parentNodeId: parentRun.rootNodeId,
           task: taskPrompt(input),
+          ...(input.planTaskRef === undefined ? {} : { planTaskRef: input.planTaskRef }),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
           runtimeMode,
@@ -2635,7 +2690,8 @@ const make = Effect.gen(function* () {
         })
         .pipe(
           Effect.mapError((error) =>
-            error._tag === "ThreadManagementProviderInstanceDisabledError"
+            error._tag === "ThreadManagementProviderInstanceDisabledError" ||
+            error._tag === "OrchestratorTeamPlanPatchError"
               ? threadManagementFailure(error)
               : failure(
                   "orchestration_error",

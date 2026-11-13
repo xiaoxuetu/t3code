@@ -290,6 +290,13 @@ export function applyOrchestrationV2ProjectionEvent(
   const latestLocalTurnOrdinal = options?.latestLocalTurnOrdinal;
   const base = { ...projection, updatedAt: event.occurredAt };
   switch (event.type) {
+    case "team-plan.updated":
+      if (
+        event.payload.threadId !== projection.thread.id ||
+        event.payload.plan.threadId !== projection.thread.id
+      )
+        return projection;
+      return { ...base, teamPlan: event.payload.plan };
     case "thread.pull-request-link-updated":
       return {
         ...base,

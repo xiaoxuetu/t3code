@@ -4,9 +4,9 @@ Use one coordinator conversation to agree on a goal, divide the work, and assign
 
 ## Start a team
 
-Open a thread in your project and send a request such as:
+Choose the coordinator's available provider and model in a project conversation. Open **Thread details > Task plan**, enter the goal, and select **Prepare team**. This explicitly enables the bundled pstack-based workflow in that conversation. The coordinator discovers available executors and proposes a saved task list; it is not fixed to Codex.
 
-> Read `integrations/pstack/t3-team.md` from this checkout. First discuss my goal and propose a task list with owners, scope, dependencies, and acceptance checks. Wait for my confirmation of that list, then assign available executors from the providers I approve. Keep a reviewer separate from the author, and link every task to its conversation. My goal is: …
+Review the task briefs, assigned models, dependencies and acceptance checks. Select **Confirm plan**, then **Continue team** to ask the coordinator to advance it. These actions use the conversation's current provider, model and permissions. An unavailable or unauthenticated executor must be configured before it can do real work. Editing or reordering the plan alone never sends a model request.
 
 Include any provider or model preferences, usage budget, permission limits, and concurrency limit. The coordinator and task owners are not fixed to Codex: it chooses an executor and model for each task from your approved Codex, Qoder, and Antigravity (AGY) instances that are actually available. An unavailable provider needs setup before it can receive work. Qoder through ACP is an unverified integration in this version.
 
@@ -16,7 +16,7 @@ Reports distinguish the selected model from the actual executed model when the p
 
 Once you have confirmed the goal and list, the coordinator assembles a temporary team automatically and creates child conversations for ready tasks. Each writer has a defined scope. Independent writers can use separate worktrees; they receive committed inputs, so tell the coordinator about any required uncommitted changes before dispatch.
 
-This workflow is explicit and opt-in. It does not install pstack or change your existing provider configuration.
+This workflow is explicit and opt-in. It supplies the bundled working conventions without installing pstack hooks or changing existing provider configuration. You can also ask a coordinator to read the packaged `pstack/t3-team.md` reference explicitly.
 
 ## Add workers for a task
 
@@ -38,7 +38,7 @@ You can add a task, clarify an existing task, or change priorities in the coordi
 
 The coordinator checks that dependencies exist and do not form a cycle before dispatch. A prerequisite needs its agreed evidence and acceptance, not just an ended agent run. A change to scope creates a new revision after the necessary confirmation; previous instructions, results, and decisions remain in history. Reprioritizing within the agreed scope does not require confirming the same plan again.
 
-The current plan lives in chat. This version has no persistent task planner, editable priority board, saved dependency graph, or stored revision history outside the conversation.
+The plan is saved with its coordinator conversation, independently of provider-native todos and loaded chat history. Task IDs stay stable; changed scope creates a new revision and preserves prior executions and review evidence. Dependency references identify specific task revisions. A stale edit cannot overwrite a newer version: reload the latest plan and reconcile the change. Manually added tasks remain unassigned until the coordinator selects an available model and you confirm that revision.
 
 ## Inspect progress
 
@@ -62,4 +62,4 @@ Ask the coordinator to pause reports or cancel named tasks when needed. When the
 
 ## Current limits
 
-The first Mac preview targets the smallest task, session, progress, and review loop; it does not verify every executor, model, or platform. The workflow and source provenance are included, and the task panel reuses T3's existing delegation state. Provider behavior, live scheduled reports, complete historical pagination, and mobile presentation have not been verified for this integration. Codex and Antigravity require their existing T3 provider setup; Qoder support is not yet verified end to end.
+Task plan uses T3's existing conversations and execution history. Local plan-linked workers can use different available providers; remote plan-linked dispatch, saved employee profiles and long-term member memory are not part of this version. Actual decomposition, model compliance, independent review, approval recovery and scheduled reports need separate verification with real providers. A mock-provider test or a GUI fixture does not establish that those workflows ran. Codex and Antigravity require their existing provider setup; Qoder can be explored through Local ACP and remains unverified end to end.

@@ -75,6 +75,20 @@ it("stamps authoritative provenance on commands that create threads or messages"
   });
   expect(stamped).not.toHaveProperty("linkOrigin");
   expect(stamped).not.toHaveProperty("delegatedFrom");
+
+  const planPatch = ThreadManagementService.withCreationProvenance(
+    {
+      type: "thread.team-plan.patch",
+      commandId: CommandId.make("command:thread-management:confirm-plan"),
+      threadId: command.threadId,
+      createdBy: "agent",
+      creationSource: "mcp",
+      expectedPlanVersion: 0,
+      operations: [{ type: "confirm_plan", revision: 1 }],
+    },
+    { createdBy: "user", creationSource: "web" },
+  );
+  expect(planPatch).toMatchObject({ createdBy: "user", creationSource: "web" });
 });
 
 const layerReceiptsTest = CommandReceiptStore.layer.pipe(

@@ -18,6 +18,7 @@ import {
 import * as DateTime from "effect/DateTime";
 
 import { applyOrchestrationV2ProjectionEvent } from "./orchestrationV2Projection.ts";
+import { createTeamPlan } from "@t3tools/shared/teamPlan";
 
 const now = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
 const threadId = ThreadId.make("thread-reducer");
@@ -106,6 +107,34 @@ const emptyProjection = {
 } as OrchestrationV2ThreadProjection;
 
 describe("applyOrchestrationV2ProjectionEvent", () => {
+  it("streams a saved team plan without replacing execution or paged conversation state", () => {
+    const plan = {
+      ...createTeamPlan({ threadId, now: DateTime.formatIso(now), goal: "Inspect a fixture" }),
+      version: 1,
+    };
+    const projection = { ...emptyProjection, runs: [run] };
+    const event: OrchestrationV2DomainEvent = {
+      id: "team-plan-update" as OrchestrationV2DomainEvent["id"],
+      type: "team-plan.updated",
+      threadId,
+      occurredAt: now,
+      payload: { threadId, plan },
+    };
+    const next = applyOrchestrationV2ProjectionEvent(projection, event, { partialTimeline: true });
+    expect(next?.teamPlan).toBe(plan);
+    expect(next?.runs).toBe(projection.runs);
+    expect(next?.subagents).toBe(projection.subagents);
+    expect(next?.messages).toBe(projection.messages);
+    expect(next?.plans).toBe(projection.plans);
+    expect(projection.teamPlan).toBeUndefined();
+    expect(
+      applyOrchestrationV2ProjectionEvent(projection, {
+        ...event,
+        payload: { threadId: ThreadId.make("other-thread"), plan },
+      }),
+    ).toBe(projection);
+  });
+
   it("applies a compact PR sync without replacing other links or thread metadata", () => {
     const link = (number: number): ThreadPullRequestLink => ({
       host: "github.com",

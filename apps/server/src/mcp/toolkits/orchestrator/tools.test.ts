@@ -27,3 +27,55 @@ it("refuses a t3_thread_update whose fields do not fit its action", () => {
     true,
   );
 });
+
+it("keeps team-plan confirmation and execution binding outside the agent tool schema", () => {
+  const decode = Schema.decodeUnknownExit(OrchestratorToolkit.tools.team_plan.parametersSchema);
+  expect(Exit.isSuccess(decode({ action: "read" }))).toBe(true);
+  for (const operation of [
+    { type: "confirm_plan", revision: 1 },
+    { type: "confirm_task", taskId: "T1", revision: 1 },
+    {
+      type: "bind_execution",
+      taskId: "T1",
+      revision: 1,
+      execution: { subagentId: "node:worker", threadId: "thread:worker", runId: "run:worker" },
+    },
+  ]) {
+    expect(
+      Exit.isFailure(
+        decode({
+          action: "patch",
+          expectedPlanVersion: 0,
+          operations: [operation],
+        }),
+      ),
+    ).toBe(true);
+  }
+  expect(Exit.isFailure(decode({ action: "confirm", revision: 1 }))).toBe(true);
+  expect(
+    Exit.isFailure(
+      decode({
+        action: "patch",
+        expectedPlanVersion: 0,
+        operations: [],
+      }),
+    ),
+  ).toBe(true);
+  expect(
+    Exit.isSuccess(
+      decode({
+        action: "patch",
+        expectedPlanVersion: 1,
+        operations: [
+          {
+            type: "accept_task",
+            taskId: "T1",
+            revision: 1,
+            status: "accepted",
+            note: "Reviewed the completed child report.",
+          },
+        ],
+      }),
+    ),
+  ).toBe(true);
+});

@@ -20,6 +20,23 @@ const handlers = {
       return yield* service.capabilities(scope, input);
     }),
   ),
+  team_plan: McpToolAccess.either(
+    (input) => input.action === "read",
+    McpToolAccess.readsAsCaller((input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service.teamPlan(scope, input);
+      }),
+    ),
+    McpToolAccess.actsAsCaller((input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service.teamPlan(scope, input);
+      }),
+    ),
+  ),
   delegate_task: McpToolAccess.actsAsCaller((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

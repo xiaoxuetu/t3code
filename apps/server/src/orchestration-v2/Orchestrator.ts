@@ -4,7 +4,16 @@ import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
+  TeamPlan,
+  TeamPlanExecutionRef,
+  TeamPlanOperation,
 } from "@t3tools/contracts";
+import {
+  applyTeamPlanPatch,
+  teamPlanTaskReadiness,
+  teamPlanTaskCommandId,
+  teamPlanTaskRevision,
+} from "@t3tools/shared/teamPlan";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -79,6 +88,7 @@ import {
   managedRuntimeModeCeilingMessage,
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import { taskPrompt } from "../mcp/delegatedTaskModes.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { modelSwitchSince } from "./modelSwitch.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
@@ -213,6 +223,23 @@ export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDi
 ) {
   override get message(): string {
     return `Failed to dispatch orchestration command ${this.commandType} (${this.commandId}).`;
+  }
+}
+
+export class OrchestratorTeamPlanPatchError extends Schema.TaggedError<OrchestratorTeamPlanPatchError>()(
+  "OrchestratorTeamPlanPatchError",
+  {
+    commandId: CommandId,
+    threadId: ThreadId,
+    reason: Schema.String,
+    expectedPlanVersion: Schema.optional(Schema.Int),
+    actualPlanVersion: Schema.optional(Schema.Int),
+  },
+) {
+  override get message(): string {
+    return this.reason === "version-conflict"
+      ? `The team plan changed from version ${this.expectedPlanVersion} to ${this.actualPlanVersion}. Refresh the plan before editing it.`
+      : `The team plan could not be changed (${this.reason}).`;
   }
 }
 
@@ -360,6 +387,7 @@ export class OrchestratorCommandIdConflictError extends Schema.TaggedError<Orche
 
 export const OrchestratorV2Error = Schema.Union([
   OrchestratorDispatchError,
+  OrchestratorTeamPlanPatchError,
   OrchestratorThreadAlreadyExistsError,
   OrchestratorCommandRejectedError,
   OrchestratorProjectionError,
@@ -626,6 +654,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.visit":
     case "thread.mark-unread":
     case "thread.metadata.update":
+    case "thread.team-plan.patch":
     case "thread.pull-request.link":
     case "thread.pull-request.unlink":
     case "thread.pull-request-link.sync":
@@ -3866,6 +3895,160 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: decided.success.thread,
     });
     return decided.success;
+  });
+
+  const validateTeamPlanExecution = Effect.fn("Orchestrator.validateTeamPlanExecution")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.team-plan.patch" }>,
+    execution: TeamPlanExecutionRef,
+    requireCompleted: boolean,
+  ) {
+    if (execution.threadId === command.threadId || execution.runId === null) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "execution-not-owned",
+      });
+    }
+    const parent = yield* projectionStore
+      .getThreadRecords(command.threadId, ["subagents"])
+      .pipe(mapDispatchError(command));
+    const task = parent.subagents.find((candidate) => candidate.id === execution.subagentId);
+    if (
+      task?.origin !== "app_owned" ||
+      task.threadId !== command.threadId ||
+      task.childThreadId !== execution.threadId
+    ) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "execution-not-owned",
+      });
+    }
+    const child = yield* projectionStore
+      .getThreadRecords(execution.threadId, ["runs"])
+      .pipe(mapDispatchError(command));
+    const run = child.runs.find((candidate) => candidate.id === execution.runId);
+    const originalRun = child.runs.toSorted((left, right) => left.ordinal - right.ordinal)[0];
+    const matchesTask =
+      run?.delegatedTaskId === execution.subagentId ||
+      (run?.delegatedTaskId === undefined &&
+        originalRun?.id === execution.runId &&
+        child.thread.forkedFrom?.type === "node" &&
+        child.thread.forkedFrom.nodeId === execution.subagentId);
+    if (
+      child.thread.lineage.parentThreadId !== command.threadId ||
+      child.thread.lineage.relationshipToParent !== "subagent" ||
+      run === undefined ||
+      run.threadId !== execution.threadId ||
+      !matchesTask
+    ) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "execution-not-owned",
+      });
+    }
+    if (requireCompleted && (run.status !== "completed" || task.status !== "completed")) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "execution-not-completed",
+      });
+    }
+  });
+
+  const dispatchTeamPlanPatch = Effect.fn("Orchestrator.dispatchTeamPlanPatch")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.team-plan.patch" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const thread = yield* projectionStore
+      .getThread(command.threadId)
+      .pipe(mapDispatchError(command));
+    if (thread.deletedAt !== null || command.createdBy === "system") {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: "invalid-owner",
+      });
+    }
+    const plan = yield* projectionStore
+      .getTeamPlan(command.threadId)
+      .pipe(mapDispatchError(command));
+    const operations: Array<TeamPlanOperation> = [];
+    for (const operation of command.operations) {
+      if (
+        command.createdBy !== "user" &&
+        (operation.type === "confirm_plan" ||
+          operation.type === "confirm_task" ||
+          operation.type === "bind_execution")
+      ) {
+        return yield* new OrchestratorTeamPlanPatchError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+          reason: "user-confirmation-required",
+        });
+      }
+      if (operation.type === "bind_execution") {
+        yield* validateTeamPlanExecution(command, operation.execution, false);
+      }
+      if (operation.type === "accept_task") {
+        if (command.createdBy === "agent") {
+          const task = plan?.tasks.find((candidate) => candidate.taskId === operation.taskId);
+          const revision =
+            task === undefined ? undefined : teamPlanTaskRevision(task, operation.revision);
+          if (
+            revision === undefined ||
+            operation.note.trim() === "" ||
+            (operation.status === "accepted" && revision.executions.length === 0)
+          ) {
+            return yield* new OrchestratorTeamPlanPatchError({
+              commandId: command.commandId,
+              threadId: command.threadId,
+              reason: "independent-review-required",
+            });
+          }
+          for (const execution of revision.executions) {
+            yield* validateTeamPlanExecution(command, execution, operation.status === "accepted");
+          }
+        }
+        operations.push({
+          ...operation,
+          actor: command.createdBy === "agent" ? "coordinator" : "user",
+          reviewerThreadId: command.threadId,
+        });
+      } else operations.push(operation);
+    }
+    const now = yield* DateTime.now;
+    const decided = applyTeamPlanPatch(
+      plan,
+      {
+        expectedPlanVersion: command.expectedPlanVersion,
+        operations,
+      },
+      { threadId: command.threadId, now: DateTime.formatIso(now) },
+    );
+    if (!decided.ok) {
+      return yield* new OrchestratorTeamPlanPatchError({
+        commandId: command.commandId,
+        threadId: command.threadId,
+        reason: decided.error.code,
+        ...(decided.error.expectedPlanVersion === undefined
+          ? {}
+          : { expectedPlanVersion: decided.error.expectedPlanVersion }),
+        ...(decided.error.actualPlanVersion === undefined
+          ? {}
+          : { actualPlanVersion: decided.error.actualPlanVersion }),
+      });
+    }
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "team-plan.updated",
+      threadId: command.threadId,
+      occurredAt: now,
+      payload: { threadId: command.threadId, plan: decided.plan },
+    });
   });
 
   const dispatchThreadMutation = Effect.fn("orchestrationV2.dispatch.threadMutation")(function* (
@@ -9010,7 +9193,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentProjection = yield* projectionStore
         .getThreadRecords(
           command.parentThreadId,
-          ["runs", "nodes", "providerThreads", "providerTurns", "attempts"],
+          ["runs", "nodes", "providerThreads", "providerTurns", "attempts", "teamPlan"],
           // The parent node must belong to the active run, whose nodes this keeps.
           { omitSettledLeafNodes: true },
         )
@@ -9053,6 +9236,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandType: command.type,
           cause: `Parent node ${command.parentNodeId} is not part of active run ${parentRun.id}.`,
         });
+      }
+
+      const teamPlan: TeamPlan | null = parentProjection.teamPlan ?? null;
+      if (teamPlan !== null && command.planTaskRef === undefined) {
+        return yield* new OrchestratorTeamPlanPatchError({
+          commandId: command.commandId,
+          threadId: command.parentThreadId,
+          reason: "plan-task-reference-required",
+        });
+      }
+      if (command.planTaskRef !== undefined) {
+        const plannedTask = teamPlan?.tasks.find(
+          (candidate) => candidate.taskId === command.planTaskRef?.taskId,
+        );
+        const readiness =
+          teamPlan === null
+            ? { ready: false, reason: "missing-plan" }
+            : teamPlanTaskReadiness(teamPlan, command.planTaskRef.taskId);
+        const reason =
+          plannedTask?.revision !== command.planTaskRef.revision
+            ? "stale-revision"
+            : !readiness.ready
+              ? (readiness.reason ?? "task-not-ready")
+              : plannedTask.modelSelection === null ||
+                  !modelSelectionsEqual(plannedTask.modelSelection, command.modelSelection)
+                ? "model-selection-mismatch"
+                : null;
+        if (reason !== null || plannedTask === undefined) {
+          return yield* new OrchestratorTeamPlanPatchError({
+            commandId: command.commandId,
+            threadId: command.parentThreadId,
+            reason: reason ?? "missing-task",
+          });
+        }
+        // A plan reference executes the user's confirmed scope, not a replacement brief from a caller.
+        command = {
+          ...command,
+          task: taskPrompt({ task: plannedTask.prompt, role: plannedTask.role }),
+          title: plannedTask.title,
+        };
       }
 
       const targetAdapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(
@@ -9232,6 +9455,35 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandId: command.commandId,
           commandType: command.type,
           cause: `Delegated child thread ${childThreadId} did not create a run.`,
+        });
+      }
+      if (teamPlan !== null && command.planTaskRef !== undefined) {
+        const bound = applyTeamPlanPatch(
+          teamPlan,
+          {
+            expectedPlanVersion: teamPlan.version,
+            operations: [
+              {
+                type: "bind_execution",
+                ...command.planTaskRef,
+                execution: { subagentId: taskNodeId, threadId: childThreadId, runId: childRun.id },
+              },
+            ],
+          },
+          { threadId: command.parentThreadId, now: DateTime.formatIso(now) },
+        );
+        if (!bound.ok) {
+          return yield* new OrchestratorTeamPlanPatchError({
+            commandId: command.commandId,
+            threadId: command.parentThreadId,
+            reason: bound.error.code,
+          });
+        }
+        yield* emitEvent({
+          type: "team-plan.updated",
+          threadId: command.parentThreadId,
+          occurredAt: now,
+          payload: { threadId: command.parentThreadId, plan: bound.plan },
         });
       }
       const spawnTransferId = yield* mapDispatchError(command)(
@@ -14435,6 +14687,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.visit":
         yield* dispatchThreadVisit(command, events);
         break;
+      case "thread.team-plan.patch":
+        yield* dispatchTeamPlanPatch(command, events);
+        break;
       case "thread.auto-settle": {
         // Recheck live state; changes and explicit overrides take precedence over the sweep snapshot.
         const thread = yield* projectionStore
@@ -14929,6 +15184,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
       Effect.catch((cause) =>
         Effect.gen(function* () {
+          // Plan identities survive provider sessions; unmet prerequisites must not poison that identity.
+          if (command.type === "delegated_task.request" && command.planTaskRef !== undefined) {
+            return yield* cause;
+          }
           // Refusals depend on modes the user can change; a recorded rejection would block the retry.
           if (
             cause._tag === "OrchestratorThreadAboveModeLimitError" ||
@@ -15134,6 +15393,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
   const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
+    if (command.type === "delegated_task.request" && command.planTaskRef !== undefined) {
+      command = {
+        ...command,
+        commandId: teamPlanTaskCommandId(command.parentThreadId, command.planTaskRef),
+      };
+    }
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       dispatchWithReceiptEffect(command),

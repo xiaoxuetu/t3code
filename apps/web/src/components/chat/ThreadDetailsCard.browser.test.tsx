@@ -1,5 +1,6 @@
+import "~/index.css";
 import { StrictMode } from "react";
-import { EnvironmentId, ThreadId, type ScopedThreadRef } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type ScopedThreadRef, type TeamPlan } from "@t3tools/contracts";
 import { expect, it } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 import { act, render } from "../../../test/render";
@@ -8,6 +9,7 @@ import { PopoverCreateHandle } from "../ui/popover";
 import { ChatCanvasContext } from "./ChatCanvasContext";
 import { resolveChatCanvasLayout } from "./chatCanvasLayout";
 import { ThreadDetailsCard } from "./ThreadDetailsCard";
+import { TaskPlanPanel } from "./TaskPlanPanel";
 
 const threadA: ScopedThreadRef = {
   environmentId: EnvironmentId.make("environment"),
@@ -45,6 +47,7 @@ function Card({
   rows = 1,
   automationRows = 0,
   serverOverflowRows = 0,
+  teamPlan,
 }: {
   threadRef: ScopedThreadRef;
   inline: boolean;
@@ -55,6 +58,7 @@ function Card({
   automationRows?: number;
   /** Rows of 100px that expanded server lists add, which density ignores. */
   serverOverflowRows?: number;
+  teamPlan?: TeamPlan;
 }) {
   return (
     // The web root renders in StrictMode, which re-runs ref callbacks on every mount.
@@ -83,6 +87,9 @@ function Card({
               <p style={{ height: density === "full" ? rows * 100 : 50 }}>
                 Details for {threadRef.threadId}
               </p>
+              {density === "full" && teamPlan ? (
+                <TaskPlanPanel plan={teamPlan} canEdit onPatch={async () => ({ ok: true })} />
+              ) : null}
               {density === "full" && automationRows > 0 ? (
                 <section data-thread-automations-panel style={{ height: automationRows * 100 }} />
               ) : null}
@@ -195,4 +202,53 @@ it("stays full while expanded server rows overflow", async () => {
   await expect
     .element(page.getByRole("region", { name: "Thread details" }))
     .toHaveAttribute("data-density", "full");
+});
+
+it("keeps a long task plan and its edit form available at full density with bounded scrolling", async () => {
+  using fixture = setup();
+  const at = "2026-11-13T10:00:00.000Z";
+  const teamPlan: TeamPlan = {
+    threadId: threadB.threadId,
+    version: 1,
+    revision: 1,
+    goal: "Verify an editable persistent task list without starting providers.",
+    confirmedRevision: null,
+    createdAt: at,
+    updatedAt: at,
+    tasks: Array.from({ length: 20 }, (_, index) => ({
+      taskId: `T${index + 1}`,
+      revision: 1,
+      title: `Fixture task ${index + 1}`,
+      prompt: "Inspect the synthetic fixture and report its observable result.",
+      role: "review",
+      priority: index,
+      modelSelection: null,
+      dependencies: [],
+      confirmedRevision: null,
+      acceptance: { status: "pending", note: "", updatedAt: at },
+      executions: [],
+      history: [],
+      createdAt: at,
+      updatedAt: at,
+    })),
+  };
+  await using screen = await render(
+    <Card threadRef={threadB} inline fixture={fixture} rows={2} teamPlan={teamPlan} />,
+  );
+  const card = page.getByRole("region", { name: "Thread details" });
+  await expect.element(card).toHaveAttribute("data-density", "full");
+  await expect.element(screen.getByRole("region", { name: "Task plan" })).toBeVisible();
+  const scrollable = screen.container.querySelector<HTMLElement>("[data-thread-team-plan-scroll]");
+  if (!scrollable) throw new Error("The task plan's scrolling container is missing.");
+  expect(getComputedStyle(scrollable).overflowY).toBe("auto");
+  expect(scrollable.clientHeight).toBeLessThanOrEqual(window.innerHeight * 0.6 + 1);
+  expect(scrollable.scrollHeight).toBeGreaterThan(scrollable.clientHeight);
+
+  await screen.getByRole("button", { name: "Add task", exact: true }).click();
+  await expect
+    .element(screen.getByRole("textbox", { name: "Task title", exact: true }))
+    .toBeVisible();
+  await expect.element(card).toHaveAttribute("data-density", "full");
+  await screen.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect.element(screen.getByRole("button", { name: "Add task", exact: true })).toBeEnabled();
 });

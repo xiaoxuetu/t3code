@@ -6,11 +6,17 @@ The first target is Apple Silicon (`arm64`). This preview uses a separate applic
 
 Use the DMG and SHA-256 checksum from the same preview build. Read its `VALIDATION.json`: fixture startup, downloaded installation, real provider operation and team workflow are separate results. A CI launch or valid code signature does not establish Gatekeeper trust or notarization. Use the normal macOS installation and confirmation flow; this preview supplies no commands to disable Gatekeeper or remove quarantine. Report the actual installation result and macOS version.
 
+## Set up one executor yourself
+
+Start with one available executor and a disposable project. For a separate Codex test account, add a manually configured Codex instance with a completely separate **CODEX_HOME path** and no shadow home. Complete its normal sign-in yourself, then choose that instance and a model actually available to the account. A separate application name alone does not isolate a provider's account store. See [Codex account configuration](./providers-codex.md#multiple-cli-logins).
+
+For a headless test environment, an operator can use the official `codex login --device-auth` flow in that same dedicated profile, when the account or workspace permits device login. The operator completes browser account selection and the one-time code; no login cache needs to be copied or sent to an assistant. See [OpenAI's device authentication guide](https://developers.openai.com/codex/auth#preferred-device-code-authentication-beta). Workspace owners or admins may instead provision an eligible dedicated service account through their normal secret-management process; service-account availability depends on the workspace plan. See [OpenAI's service-account guide](https://developers.openai.com/codex/enterprise/service-accounts).
+
 ## Verify one real team workflow
 
 Start with a new disposable project, not an existing repository. Configure and authorize one available executor through the app. There is no need to finish setting up Codex, AGY and Qoder before trying the first workflow.
 
-Copy the packaged `Contents/Resources/pstack` text directory into the disposable project's `integrations/pstack`, or provide its readable absolute path to the coordinator. Ask it to read `t3-team.md`, agree on a tiny task list and use two temporary workers. A suitable first check is one worker reading a sample README and another inspecting sample package scripts, then returning separate evidence-backed summaries. Keep the tasks read-only; this checks the real delegation path without requiring a code change.
+Open **Thread details > Task plan**, enter a tiny goal and select **Prepare team**. The app supplies its bundled pstack-based working conventions to the chosen coordinator. Review the saved plan, select **Confirm plan**, then **Continue team** to request execution with two temporary workers. A suitable first check is one worker reading a sample README and another inspecting sample package scripts, then returning separate evidence-backed summaries. Keep the tasks read-only; this checks the real delegation path without requiring a code change.
 
 Confirm the proposed list, then verify:
 
@@ -24,4 +30,4 @@ Record the exact executor, model, options, app version and source commit, checks
 
 ## Preview limits
 
-Task-list additions and priorities currently live in the coordinator's chat workflow. There is no persistent editable planner or saved employee identity. Scheduled reports, cancellation/approval recovery, restart deduplication, all three executors and mobile behavior require their own checks. The first package is useful for finding integration failures; it is not a claim that every requirement has passed.
+Task plans, revisions, dependencies, user confirmations and execution references are saved with the coordinator conversation. Mechanical plan validation and simulated delegation tests do not establish real model behavior. The package's validation record distinguishes metadata GUI checks from real provider and team execution. Saved employee identities, long-term member memory, remote plan-linked workers, scheduled reporting and the complete three-executor workflow remain separate work. If an execution fails, inspect its existing session first; a fresh attempt needs an explicit new task revision and confirmation, preserving the previous result.

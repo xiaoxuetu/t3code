@@ -9,6 +9,7 @@ import {
   MessageId,
   type ModelSelection,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpTeamPlanResult,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadReadResult,
@@ -20,6 +21,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -31,6 +33,8 @@ import { McpSchema, McpServer } from "effect/ai";
 import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/CodexAdapterV2.testkit.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -198,6 +202,452 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
 );
 
 describe("orchestrator MCP toolkit", () => {
+  it.effect("owns team-plan metadata through MCP without starting any worker", () =>
+    Effect.gen(function* () {
+      const cwd = yield* checkpointWorkspace("mcp-team-plan-metadata");
+      const registry = ProviderAdapterRegistry.layerFromAdapters([
+        {
+          instanceId: codexInstanceId,
+          driver: ProviderDriverKind.make("codex"),
+          getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+          planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+          openSession: () => Effect.die("The metadata test must never open a provider session."),
+        },
+      ]);
+      const database = SqlitePersistence.layerMemory;
+      const settings = ServerSettings.layerTest();
+      const orchestration = ProviderReplayHarness.layerWithRegistry(
+        { name: "mcp-team-plan-metadata", runtimePolicyOverride: { cwd } },
+        registry,
+        { databaseLayer: database, runEffectWorker: false },
+      );
+      const threads = ThreadManagementService.layer.pipe(
+        Layer.provideMerge(orchestration),
+        Layer.provide(settings),
+        Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(database))),
+      );
+      const testLayer = layerOrchestratorToolkit.pipe(
+        Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+        Layer.provideMerge(threads),
+        Layer.provide(registry),
+        Layer.provide(ProviderRegistryMock.layer([])),
+        Layer.provide(settings),
+        Layer.provide(layerUnusedScheduledTaskStub),
+        Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+        Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+        Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+        Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+        Layer.provide(Layer.mock(SecretResolver.SecretResolver)({})),
+        Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const server = yield* McpServer.McpServer;
+        const otherThreadId = ThreadId.make("thread:team-plan-other");
+        const scope: McpInvocationContext.McpInvocationScope = {
+          environmentId: EnvironmentId.make("environment:mcp-team-plan-metadata"),
+          requestNamespace: "metadata-session",
+          thread: {
+            threadId: parentThreadId,
+            providerSessionId: "metadata-session",
+            providerInstanceId: codexInstanceId,
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const invoke = (args: Record<string, unknown>, caller = scope) =>
+          server
+            .callTool({ name: "team_plan", arguments: args })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
+              Effect.provideService(McpSchema.McpServerClient, client),
+            );
+        const decodePlan = Schema.decodeUnknownEffect(OrchestratorMcpTeamPlanResult);
+        const failureCode = (result: {
+          readonly content: ReadonlyArray<{ readonly type: string; readonly text?: string }>;
+        }) =>
+          (
+            JSON.parse(
+              result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+            ) as { code: string }
+          ).code;
+        for (const threadId of [parentThreadId, otherThreadId]) {
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`metadata:create:${threadId}`),
+            createdBy: "user",
+            creationSource: "web",
+            threadId,
+            projectId,
+            title: "Metadata owner",
+            modelSelection: codexSelection,
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+        }
+        expect(yield* decodePlan((yield* invoke({ action: "read" })).structuredContent)).toEqual({
+          threadId: parentThreadId,
+          plan: null,
+        });
+        const patch = {
+          action: "patch",
+          expectedPlanVersion: 0,
+          clientRequestId: "metadata-draft",
+          operations: [
+            { type: "set_goal", goal: "Draft only, no execution" },
+            {
+              type: "add_task",
+              task: {
+                taskId: "T1",
+                title: "Planned work",
+                prompt: "Do not execute in this test.",
+                role: "research",
+                priority: 1,
+                modelSelection: null,
+                dependencies: [],
+              },
+            },
+          ],
+        };
+        expect(failureCode(yield* invoke(patch))).toBe("parent_not_active");
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("metadata:active-owner"),
+          createdBy: "user",
+          creationSource: "web",
+          threadId: parentThreadId,
+          messageId: MessageId.make("metadata:active-owner"),
+          text: "Maintain metadata only.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        expect(
+          failureCode(
+            yield* invoke(
+              { action: "read" },
+              {
+                ...scope,
+                thread: undefined,
+                client: { sessionId: "outside", label: "outside", access: "full-access" },
+              },
+            ),
+          ),
+        ).toBe("thread_credential_required");
+        expect(
+          failureCode(
+            yield* invoke({ action: "read" }, { ...scope, capabilities: new Set(["preview"]) }),
+          ),
+        ).toBe("capability_denied");
+        const mismatched = {
+          ...scope,
+          thread: { ...scope.thread!, providerInstanceId: ProviderInstanceId.make("wrong-owner") },
+        };
+        expect(failureCode(yield* invoke(patch, mismatched))).toBe("parent_not_active");
+        const draft = yield* decodePlan((yield* invoke(patch)).structuredContent);
+        expect(draft.plan?.version).toBe(1);
+        expect(draft.plan?.confirmedRevision).toBeNull();
+        expect(yield* decodePlan((yield* invoke(patch)).structuredContent)).toEqual(draft);
+        const remoteWithoutRef = yield* server
+          .callTool({
+            name: "delegate_task",
+            arguments: {
+              task: "Do not dispatch an unconfirmed plan through a remote target.",
+              target: { environmentId: "environment:other-isolated-test" },
+              mode: "async",
+            },
+          })
+          .pipe(
+            Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+            Effect.provideService(McpSchema.McpServerClient, client),
+          );
+        expect(failureCode(remoteWithoutRef)).toBe("invalid_request");
+        const stale = yield* invoke({ ...patch, clientRequestId: "metadata-stale" });
+        expect(failureCode(stale)).toBe("invalid_request");
+        expect(yield* decodePlan((yield* invoke({ action: "read" })).structuredContent)).toEqual(
+          draft,
+        );
+        const otherScope = { ...scope, thread: { ...scope.thread!, threadId: otherThreadId } };
+        const crossThread = yield* invoke(
+          { action: "read", threadId: parentThreadId },
+          otherScope,
+        ).pipe(Effect.exit);
+        expect(Exit.isFailure(crossThread)).toBe(true);
+        expect(
+          yield* decodePlan((yield* invoke({ action: "read" }, otherScope)).structuredContent),
+        ).toEqual({ threadId: otherThreadId, plan: null });
+        yield* orchestrator.dispatch({
+          type: "thread.team-plan.patch",
+          commandId: CommandId.make("metadata:user-confirm"),
+          threadId: parentThreadId,
+          createdBy: "user",
+          creationSource: "web",
+          expectedPlanVersion: draft.plan!.version,
+          operations: [{ type: "confirm_plan", revision: draft.plan!.revision }],
+        });
+        const confirmed = yield* decodePlan((yield* invoke({ action: "read" })).structuredContent);
+        expect(confirmed.plan?.confirmedRevision).toBe(confirmed.plan?.revision);
+        expect((yield* orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(0);
+        expect((yield* orchestrator.getThreadProjection(otherThreadId)).teamPlan).toBeNull();
+      }).pipe(Effect.provide(testLayer));
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "persists coordinator plans without granting agent confirmation or duplicate dispatch",
+    () =>
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("mcp-team-plan");
+        const registry = ProviderAdapterRegistry.layerFromAdapters([
+          {
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+            planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+            openSession: () => Effect.die("This integration test never starts a provider."),
+          },
+        ]);
+        const database = SqlitePersistence.layerMemory;
+        const settings = ServerSettings.layerTest();
+        const orchestration = ProviderReplayHarness.layerWithRegistry(
+          { name: "mcp-team-plan", runtimePolicyOverride: { cwd } },
+          registry,
+          { databaseLayer: database, runEffectWorker: false },
+        );
+        const threads = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(orchestration),
+          Layer.provide(settings),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(database))),
+        );
+        const testLayer = layerOrchestratorToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provideMerge(threads),
+          Layer.provide(registry),
+          Layer.provide(
+            ProviderRegistryMock.layer([
+              makeProviderSnapshot({
+                instanceId: codexInstanceId,
+                driver: ProviderDriverKind.make("codex"),
+                model: codexModel,
+              }),
+            ]),
+          ),
+          Layer.provide(settings),
+          Layer.provide(layerUnusedScheduledTaskStub),
+          Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+          Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+          Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+          Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+          Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+          Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+          Layer.provide(Layer.mock(SecretResolver.SecretResolver)({})),
+          Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const server = yield* McpServer.McpServer;
+          const scope: McpInvocationContext.McpInvocationScope = {
+            environmentId: EnvironmentId.make("environment:mcp-team-plan"),
+            requestNamespace: "team-plan-session-1",
+            thread: {
+              threadId: parentThreadId,
+              providerSessionId: "team-plan-session-1",
+              providerInstanceId: codexInstanceId,
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const invoke = (name: string, args: Record<string, unknown>, caller = scope) =>
+            server
+              .callTool({ name, arguments: args })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
+                Effect.provideService(McpSchema.McpServerClient, client),
+              );
+          const decodePlan = Schema.decodeUnknownEffect(OrchestratorMcpTeamPlanResult);
+          const failureCode = (result: {
+            readonly content: ReadonlyArray<{ readonly type: string; readonly text?: string }>;
+          }) => {
+            const value = JSON.parse(
+              result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+            ) as { code: string };
+            return value.code;
+          };
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("team-plan:create"),
+            createdBy: "user",
+            creationSource: "web",
+            threadId: parentThreadId,
+            projectId,
+            title: "Coordinator",
+            modelSelection: codexSelection,
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+          });
+          const empty = yield* invoke("team_plan", { action: "read" });
+          expect(yield* decodePlan(empty.structuredContent)).toEqual({
+            threadId: parentThreadId,
+            plan: null,
+          });
+          const draft = {
+            action: "patch",
+            expectedPlanVersion: 0,
+            clientRequestId: "draft-1",
+            operations: [
+              { type: "set_goal", goal: "Inspect a fixture" },
+              {
+                type: "add_task",
+                task: {
+                  taskId: "T1",
+                  title: "Read README",
+                  prompt: "Read README only.",
+                  role: "research",
+                  priority: 1,
+                  modelSelection: codexSelection,
+                  dependencies: [],
+                },
+              },
+            ],
+          };
+          expect(failureCode(yield* invoke("team_plan", draft))).toBe("parent_not_active");
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("team-plan:start"),
+            createdBy: "user",
+            creationSource: "web",
+            threadId: parentThreadId,
+            messageId: MessageId.make("team-plan:start"),
+            text: "Prepare a team plan.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          const external: McpInvocationContext.McpInvocationScope = {
+            ...scope,
+            thread: undefined,
+            client: { sessionId: "outside", label: "outside", access: "full-access" },
+          };
+          expect(failureCode(yield* invoke("team_plan", { action: "read" }, external))).toBe(
+            "thread_credential_required",
+          );
+          expect(
+            failureCode(
+              yield* invoke("team_plan", draft, { ...scope, capabilities: new Set(["preview"]) }),
+            ),
+          ).toBe("capability_denied");
+          const drafted = yield* decodePlan((yield* invoke("team_plan", draft)).structuredContent);
+          expect(drafted.plan?.version).toBe(1);
+          expect(drafted.plan?.confirmedRevision).toBeNull();
+          const duplicateDraft = yield* decodePlan(
+            (yield* invoke("team_plan", draft)).structuredContent,
+          );
+          expect(duplicateDraft).toEqual(drafted);
+          const stale = yield* invoke("team_plan", { ...draft, clientRequestId: "stale-draft" });
+          expect(stale.isError).toBe(true);
+          expect(
+            yield* decodePlan((yield* invoke("team_plan", { action: "read" })).structuredContent),
+          ).toEqual(drafted);
+          const plan = drafted.plan!;
+          const ref = { taskId: "T1", revision: plan.tasks[0]!.revision };
+          const delegation = {
+            task: "Read README only.",
+            title: "T1: Read README",
+            role: "research",
+            planTaskRef: ref,
+            target: { providerInstanceId: codexInstanceId, model: codexModel },
+            isolation: "shared",
+            mode: "async",
+            clientRequestId: "dispatch-session-1",
+          };
+          expect((yield* invoke("delegate_task", delegation)).isError).toBe(true);
+          expect((yield* orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(
+            0,
+          );
+          yield* orchestrator.dispatch({
+            type: "thread.team-plan.patch",
+            commandId: CommandId.make("team-plan:user-confirm"),
+            threadId: parentThreadId,
+            createdBy: "user",
+            creationSource: "web",
+            expectedPlanVersion: plan.version,
+            operations: [{ type: "confirm_plan", revision: plan.revision }],
+          });
+          const first = yield* decodeDelegateTaskResult(
+            (yield* invoke("delegate_task", delegation)).structuredContent,
+          );
+          const secondScope = {
+            ...scope,
+            requestNamespace: "team-plan-session-2",
+            thread: { ...scope.thread!, providerSessionId: "team-plan-session-2" },
+          };
+          const repeated = yield* decodeDelegateTaskResult(
+            (yield* invoke(
+              "delegate_task",
+              { ...delegation, clientRequestId: "different-session-key" },
+              secondScope,
+            )).structuredContent,
+          );
+          expect(repeated.taskId).toBe(first.taskId);
+          expect(repeated.childThreadId).toBe(first.childThreadId);
+          expect((yield* orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(
+            1,
+          );
+          const linked = yield* decodePlan(
+            (yield* invoke("team_plan", { action: "read" })).structuredContent,
+          );
+          expect(linked.plan?.tasks[0]?.executions).toHaveLength(1);
+          const childScope = {
+            ...scope,
+            requestNamespace: "child-session",
+            thread: {
+              threadId: localChild(first.childThreadId),
+              providerSessionId: "child-session",
+              providerInstanceId: codexInstanceId,
+            },
+          };
+          const foreignPlanRead = yield* invoke(
+            "team_plan",
+            { action: "read", threadId: parentThreadId },
+            childScope,
+          ).pipe(Effect.flip);
+          expect(foreignPlanRead).toMatchObject({
+            _tag: "InvalidParams",
+            code: -32602,
+            message: expect.stringContaining('Unknown argument "threadId"'),
+          });
+          const childPlan = yield* decodePlan(
+            (yield* invoke("team_plan", { action: "read" }, childScope)).structuredContent,
+          );
+          expect(childPlan.threadId).toBe(first.childThreadId);
+          expect(childPlan.plan).toBeNull();
+          const prematureAcceptance = yield* invoke("team_plan", {
+            action: "patch",
+            expectedPlanVersion: linked.plan!.version,
+            operations: [
+              {
+                type: "accept_task",
+                ...ref,
+                status: "accepted",
+                note: "Cannot accept an unfinished worker.",
+              },
+            ],
+          });
+          expect(prematureAcceptance.isError).toBe(true);
+          const after = yield* decodePlan(
+            (yield* invoke("team_plan", { action: "read" })).structuredContent,
+          );
+          expect(after).toEqual(linked);
+        }).pipe(Effect.provide(testLayer));
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it.live.each([
     { label: "distinct", result: queuedFollowupResult, latestSummary: queuedFollowupResult },
     { label: "identical", result: delegatedResult, latestSummary: null },

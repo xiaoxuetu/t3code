@@ -1,7 +1,6 @@
 import {
   type ModelSelection,
   OrchestratorMcpFailure,
-  type OrchestratorMcpDelegateTaskInput,
   type OrchestratorMcpInteractionMode,
   type OrchestratorMcpRuntimeMode,
   type ProviderInteractionMode,
@@ -88,7 +87,10 @@ export function resolveInteractionMode(
 }
 
 /** The task as its child receives it, with the role the caller asked for. */
-export function taskPrompt(input: OrchestratorMcpDelegateTaskInput): string {
+export function taskPrompt(input: {
+  readonly task: string;
+  readonly role?: string | undefined;
+}): string {
   return input.role === undefined || input.role === "general"
     ? input.task
     : `Act as the ${input.role} sub-agent for this task.\n\n${input.task}`;

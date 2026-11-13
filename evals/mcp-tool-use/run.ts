@@ -7,6 +7,7 @@
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
@@ -38,6 +39,7 @@ import * as McpSchema from "effect/ai/McpSchema";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
+import { buildTeamCoordinatorPrompt } from "../../apps/web/src/components/chat/teamCoordinatorPrompt.ts";
 import * as McpInvocationContext from "../../apps/server/src/mcp/McpInvocationContext.ts";
 import { advertisedJsonSchema } from "../../apps/server/src/mcp/advertisedJsonSchema.ts";
 import * as Contracts from "@t3tools/contracts";
@@ -303,6 +305,14 @@ export const McpToolUseCase = Schema.Struct({
   privacy: Schema.optional(Schema.Literals(["commit-safe", "private"])),
   setup: Schema.Struct({
     role: Schema.Literals(["top", "delegated-child", "native-subagent"]),
+    /** Build the user's coordinator request with the product's current builder and workflow. */
+    teamCoordinatorPrompt: Schema.optional(
+      Schema.Struct({
+        phase: Schema.Literals(["prepare", "continue"]),
+        goal: Schema.String,
+        planVersion: Schema.optional(Schema.Number),
+      }),
+    ),
     /** Runs only on this harness, for cases whose right answer depends on it. */
     harness: Schema.optional(Schema.Literals(["claude", "codex"])),
     /** The Linked environments beta is on, so T3 lists its link tools. */
@@ -879,7 +889,26 @@ type Sample = {
 
 const SHELL_TOOLS = new Set(["Bash", "Read", "Edit", "Write", "WebFetch"]);
 
-export const makeSample = (testCase: McpToolUseCase, base: Base): Sample => {
+export const makeSample = (inputCase: McpToolUseCase, base: Base): Sample => {
+  const coordinator = inputCase.setup.teamCoordinatorPrompt;
+  if (coordinator !== undefined && (inputCase.setup.role !== "top" || inputCase.prompt !== "")) {
+    throw new Error(
+      `${inputCase.id}: A coordinator builder needs a top-level case with an empty prompt.`,
+    );
+  }
+  const testCase =
+    coordinator === undefined
+      ? inputCase
+      : {
+          ...inputCase,
+          prompt: buildTeamCoordinatorPrompt({
+            ...coordinator,
+            workflowText: NodeFS.readFileSync(
+              new URL("../../integrations/pstack/t3-team.md", import.meta.url),
+              "utf8",
+            ),
+          }),
+        };
   const prior = testCase.setup.priorTurns ?? [];
   const priorCalls = prior.flatMap((turn) => turn.toolCalls ?? []);
   const repo = testCase.setup.world?.repo ?? "acme/app";

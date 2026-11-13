@@ -15,7 +15,7 @@ on:
         description: "Version for this macOS engineering preview"
         type: string
         required: true
-        default: "0.1.0-workbench.3"
+        default: "0.1.0-workbench.5"
 
 permissions:
   contents: read
@@ -33,6 +33,8 @@ jobs:
         (github.event_name == 'workflow_dispatch' && inputs.allow_dependency_execution))
     runs-on: macos-26
     timeout-minutes: 90
+    outputs:
+      build_version: ${{ steps.build_identity.outputs.version }}
     env:
       BUILD_VERSION: ${{ inputs.version || format('0.1.0-workbench.{0}', github.run_number) }}
       APP_VERSION: ${{ inputs.version || format('0.1.0-workbench.{0}', github.run_number) }}
@@ -40,6 +42,8 @@ jobs:
       T3CODE_DESKTOP_SIGNED: "false"
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
       NODE_OPTIONS: --max-old-space-size=4096
+      VP_REMOTE_CACHE: "off"
+      VP_REMOTE_CACHE_URL: "http://127.0.0.1:9"
     steps:
       - name: Initialize isolated Workbench state
         shell: bash
@@ -65,7 +69,7 @@ jobs:
         run: |
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          node --input-type=module -e 'if (!/^\d+\.\d+\.\d+-workbench\.\d+$/.test(process.env.BUILD_VERSION ?? "")) throw new Error("Use a version such as 0.1.0-workbench.3")'
+          node --input-type=module -e 'if (!/^\d+\.\d+\.\d+-workbench\.\d+$/.test(process.env.BUILD_VERSION ?? "")) throw new Error("Invalid Workbench preview version")'
           sw_vers
           xcrun --find clang
           xcrun --find iconutil
@@ -78,6 +82,17 @@ jobs:
         uses: ./.github/actions/setup-ci-deps
         with:
           install-args: --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Validate exact Workbench build identity
+        id: build_identity
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+          import { parseWorkbenchPreviewVersion } from "./scripts/lib/mac-workbench-build-input.ts";
+          const version = parseWorkbenchPreviewVersion(process.env.BUILD_VERSION);
+          if (version === null) throw new Error("Invalid Workbench preview version");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          JS
       - name: Verify task logic, isolation boundaries and pstack provenance
         shell: bash
         run: |
@@ -91,14 +106,36 @@ jobs:
           vp exec --filter @t3tools/desktop -- effect-tsgo tsrs --noEmit
           vp exec --filter t3 -- effect-tsgo tsrs --noEmit
           vp exec --filter @t3tools/scripts -- effect-tsgo tsrs --noEmit
+      - name: Run TeamPlan contract regression tests
+        working-directory: packages/contracts
+        shell: bash
+        run: vp test run --config ../../vite.config.ts --dir . src/teamPlan.test.ts
       - name: Run focused shared regression tests
         working-directory: packages/shared
         shell: bash
-        run: vp test run --config ../../vite.config.ts --dir . src/devHome.test.ts src/providerAuthReturnUrl.test.ts src/remote.test.ts src/promptLinks.test.ts
+        run: vp test run --config ../../vite.config.ts --dir . src/devHome.test.ts src/providerAuthReturnUrl.test.ts src/remote.test.ts src/promptLinks.test.ts src/teamPlan.test.ts
+      - name: Run TeamPlan client projection regression tests
+        working-directory: packages/client-runtime
+        shell: bash
+        run: vp test run --config vite.config.ts src/state/orchestrationV2Projection.test.ts
+      - name: Run TeamPlan task panel logic regression tests
+        working-directory: apps/web
+        shell: bash
+        run: vp test run --project unit src/components/chat/TaskPlanPanel.logic.test.ts
+      - name: Run synthetic TeamPlan orchestration and persistence checks
+        working-directory: apps/server
+        shell: bash
+        run: |
+          vp test run --config vite.config.ts src/orchestration-v2/Orchestrator.teamPlan.test.ts src/orchestration-v2/Orchestrator.teamPlan-atomic.test.ts src/orchestration-v2/TeamPlanProjection.test.ts
+          vp test run --config vite.config.ts src/orchestration-v2/ThreadManagementService.test.ts -t 'stamps authoritative provenance'
+      - name: Run synthetic coordinator MCP boundary checks
+        working-directory: apps/server
+        shell: bash
+        run: vp test run --config vite.config.ts src/mcp/OrchestratorMcpToolkit.integration.test.ts src/mcp/toolkits/orchestrator/tools.test.ts -t 'persists coordinator plans|owns team-plan metadata|states t3_thread_read|refuses a t3_thread_update|keeps team-plan confirmation'
       - name: Run focused build and development regression tests
         working-directory: scripts
         shell: bash
-        run: vp test run --config ../vite.config.ts --dir . dev-runner.test.ts build-desktop-artifact.test.ts lib/desktop-smoke-process.test.ts smoke-desktop-app.test.ts
+        run: vp test run --config ../vite.config.ts --dir . dev-runner.test.ts build-desktop-artifact.test.ts lib/desktop-smoke-process.test.ts lib/mac-workbench-build-input.test.ts lib/desktop-team-plan-ui.test.ts smoke-desktop-app.test.ts smoke-workbench-team-plan.test.ts
       - name: Verify desktop profile compatibility and preload boundaries
         working-directory: apps/desktop
         shell: bash
@@ -138,6 +175,8 @@ jobs:
           ditto "$app" "$installed_app"
           codesign --verify --deep --strict --verbose=2 "$installed_app" > macos-validation/installed-codesign-verify.txt 2>&1
           binary="$installed_app/Contents/MacOS/$executable"
+          node scripts/smoke-workbench-team-plan.ts --executable "$binary" --expect-version "$BUILD_VERSION" --artifacts-dir macos-validation/launch
+          test -f macos-validation/launch/team-plan.json
           T3_PSTACK_WORKBENCH_SMOKE_DIAGNOSTICS=1 node scripts/smoke-desktop-app.ts --executable "$binary" --expect-version "$BUILD_VERSION" --artifacts-dir macos-validation/launch
           printf '%s\n' 'Packaged startup and fixture thread passed. Download Gatekeeper behavior and real provider workflows remain unverified.' > macos-validation/STATUS.txt
       - name: Record checksums and preview scope
@@ -150,7 +189,7 @@ jobs:
           if(names.length!==2) throw new Error("Expected DMG and ZIP");
           const rows=await Promise.all(names.map(async name=>`${createHash("sha256").update(await readFile(`release-workbench-macos/${name}`)).digest("hex")}  ${name}`));
           await writeFile("release-workbench-macos/SHA256SUMS",`${rows.join("\n")}\n`);
-          await writeFile("release-workbench-macos/VALIDATION.json",JSON.stringify({sourceCommit:process.env.GITHUB_SHA,platform:"darwin",arch:"arm64",packagedStartup:"passed",fixtureThread:"passed",downloadGatekeeper:"not verified",notarization:"not configured",signing:"ad-hoc; integrity checked; no Developer ID trust",realProviders:{codex:"not verified",antigravity:"not verified",qoder:"not verified"},teamWorkflow:"not verified",otherPlatforms:"deferred"},null,2)+"\n");
+          await writeFile("release-workbench-macos/VALIDATION.json",JSON.stringify({sourceCommit:process.env.GITHUB_SHA,platform:"darwin",arch:"arm64",packagedStartup:"passed",fixtureThread:"passed",downloadGatekeeper:"not verified",notarization:"not configured",signing:"ad-hoc; integrity checked; no Developer ID trust",realProviders:{codex:"not verified",antigravity:"not verified",qoder:"not verified"},teamPlanMetadata:"passed",teamWorkflow:"not verified with real provider",defaultPathCoexistence:"requires mac_arm64_isolation job",otherPlatforms:"deferred"},null,2)+"\n");
           JS
       - name: Upload validation evidence
         if: always()
@@ -165,6 +204,7 @@ jobs:
             macos-validation/minimum-system-version.txt
             macos-validation/launch/phase.json
             macos-validation/launch/version.json
+            macos-validation/launch/team-plan.json
             macos-validation/STATUS.txt
           if-no-files-found: ignore
           retention-days: 14
@@ -181,4 +221,152 @@ jobs:
             integrations/pstack/
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+
+  mac_arm64_isolation:
+    needs: mac_arm64
+    if: >-
+      github.repository == 'xiaoxuetu/t3code' &&
+      github.ref == 'refs/heads/workbench/mac-preview' &&
+      (github.event_name == 'push' ||
+        (github.event_name == 'workflow_dispatch' && inputs.allow_dependency_execution))
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      BUILD_VERSION: ${{ needs.mac_arm64.outputs.build_version }}
+      VP_REMOTE_CACHE: "off"
+      VP_REMOTE_CACHE_URL: "http://127.0.0.1:9"
+    steps:
+      - name: Initialize private dependency configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_root="$RUNNER_TEMP/workbench-isolation-dependencies-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$config_root"
+          touch "$config_root/npm-user.npmrc" "$config_root/npm-global.npmrc"
+          printf 'NPM_CONFIG_USERCONFIG=%s/npm-user.npmrc\n' "$config_root" >> "$GITHUB_ENV"
+          printf 'NPM_CONFIG_GLOBALCONFIG=%s/npm-global.npmrc\n' "$config_root" >> "$GITHUB_ENV"
+          printf 'NPM_CONFIG_CACHE=%s/npm-cache\n' "$config_root" >> "$GITHUB_ENV"
+      - name: Checkout public test source without persisted credentials
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          git init .
+          git -c credential.helper= remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git -c credential.helper= fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
+      - name: Download this run's verified build inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: t3-pstack-workbench-macos-arm64
+          path: workbench-build-input
+      - name: Setup locked host test dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --frozen-lockfile --filter=@t3tools/scripts...
+      - name: Typecheck host tests
+        working-directory: scripts
+        shell: bash
+        run: ../node_modules/.bin/effect-tsgo tsrs --noEmit
+      - name: Verify synthetic guards and observation helpers
+        working-directory: scripts
+        shell: bash
+        run: vp test run --config ../vite.config.ts --dir . lib/mac-isolation-workspace.test.ts lib/mac-isolation-process.test.ts lib/desktop-fixture-ui.test.ts lib/mac-workbench-build-input.test.ts
+      - name: Verify this build and pinned official download before any app execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          isolation_root="$RUNNER_TEMP/t3-workbench-isolation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$isolation_root"
+          printf 'WORKBENCH_ISOLATION_ROOT=%s\n' "$isolation_root" >> "$GITHUB_ENV"
+          mkdir -p macos-isolation-validation
+          curl --fail --location --retry 2 --output "$isolation_root/official.dmg" https://github.com/pingdotgg/t3code/releases/download/v0.1.9/T3-Code-0.1.9-arm64.dmg
+          export WORKBENCH_ISOLATION_INPUT="$isolation_root"
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { createHash } from "node:crypto";
+          import { parseWorkbenchPreviewVersion, resolveBuiltWorkbenchDmg } from "./scripts/lib/mac-workbench-build-input.ts";
+          const version = parseWorkbenchPreviewVersion(process.env.BUILD_VERSION);
+          if (version === null) throw new Error("Invalid Workbench preview version");
+          const input = "workbench-build-input/release-workbench-macos";
+          const built = resolveBuiltWorkbenchDmg({version, filenames: fs.readdirSync(input), checksumText: fs.readFileSync(path.join(input, "SHA256SUMS"), "utf8")});
+          if (built === null) throw new Error("Built Workbench manifest did not pass");
+          const hash = async (filename) => {
+            const h = createHash("sha256");
+            for await (const chunk of fs.createReadStream(filename)) h.update(chunk);
+            return h.digest("hex");
+          };
+          const officialSha256 = "b0a15cb7aac2461425f670b14ac52d7a207a0e2008250882c850b4cd62aa926a";
+          if (await hash(path.join(process.env.WORKBENCH_ISOLATION_INPUT, "official.dmg")) !== officialSha256) throw new Error("Pinned official asset digest mismatch");
+          const builtDmg = path.join(input, built.fileName);
+          if (await hash(builtDmg) !== built.sha256) throw new Error("Built Workbench asset digest mismatch");
+          fs.copyFileSync(builtDmg, path.join(process.env.WORKBENCH_ISOLATION_INPUT, "workbench.dmg"));
+          const fixtureSha256 = await hash("scripts/fixtures/desktop-launch/statev2.sqlite");
+          if (fixtureSha256 !== "e65f15f89a847a264cf4366cd7bcdc31cef1d5fbfd07707ed497cc0f045357b5") throw new Error("Pinned synthetic fixture digest mismatch");
+          const verified = {official: {sha256: officialSha256, matched: true}, workbench: {sha256: built.sha256, matched: true}};
+          fs.writeFileSync("macos-isolation-validation/SOURCE-DIGESTS.json", JSON.stringify({officialVersion: "0.1.9", workbenchVersion: version, fixtureSha256, verified}, null, 2)+"\n");
+          JS
+      - name: Run real default-path and concurrent-app checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          official_mount="$WORKBENCH_ISOLATION_ROOT/official-volume"
+          workbench_mount="$WORKBENCH_ISOLATION_ROOT/workbench-volume"
+          mkdir "$official_mount" "$workbench_mount"
+          cleanup_volumes() {
+            hdiutil detach "$workbench_mount" || true
+            hdiutil detach "$official_mount" || true
+          }
+          trap cleanup_volumes EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$official_mount" "$WORKBENCH_ISOLATION_ROOT/official.dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$workbench_mount" "$WORKBENCH_ISOLATION_ROOT/workbench.dmg"
+          export OFFICIAL_ISOLATION_MOUNT="$official_mount"
+          export FORK_ISOLATION_MOUNT="$workbench_mount"
+          official_app=$(node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; const a=fs.readdirSync(process.env.OFFICIAL_ISOLATION_MOUNT).filter(n=>n.endsWith(".app")); if(a.length!==1) throw new Error("Expected one official app"); process.stdout.write(path.join(process.env.OFFICIAL_ISOLATION_MOUNT,a[0]))')
+          workbench_app=$(node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; const a=fs.readdirSync(process.env.FORK_ISOLATION_MOUNT).filter(n=>n.endsWith(".app")); if(a.length!==1) throw new Error("Expected one Workbench app"); process.stdout.write(path.join(process.env.FORK_ISOLATION_MOUNT,a[0]))')
+          official_installed="$WORKBENCH_ISOLATION_ROOT/official-app/$(basename "$official_app")"
+          workbench_installed="$WORKBENCH_ISOLATION_ROOT/workbench-app/$(basename "$workbench_app")"
+          mkdir -m 700 "$WORKBENCH_ISOLATION_ROOT/official-app" "$WORKBENCH_ISOLATION_ROOT/workbench-app"
+          ditto "$official_app" "$official_installed"
+          ditto "$workbench_app" "$workbench_installed"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$official_installed/Contents/Info.plist")" = com.t3tools.t3code
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$workbench_installed/Contents/Info.plist")" = org.t3pstack.workbench
+          official_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$official_installed/Contents/Info.plist")
+          workbench_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$workbench_installed/Contents/Info.plist")
+          test "$(lipo -archs "$official_installed/Contents/MacOS/$official_executable")" = arm64
+          test "$(lipo -archs "$workbench_installed/Contents/MacOS/$workbench_executable")" = arm64
+          export OFFICIAL_ISOLATION_APP="$official_installed"
+          export FORK_ISOLATION_APP="$workbench_installed"
+          node --input-type=module <<'JS'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { spawnSync } from "node:child_process";
+          const verified = {};
+          for (const [kind, app] of [["official", process.env.OFFICIAL_ISOLATION_APP], ["workbench", process.env.FORK_ISOLATION_APP]]) {
+            const fd = fs.openSync(path.join(process.env.WORKBENCH_ISOLATION_ROOT, `${kind}-signature-local.txt`), "w", 0o600);
+            try { verified[kind] = spawnSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", app], {stdio: ["ignore", fd, fd], timeout: 60000}).status === 0; }
+            finally { fs.closeSync(fd); }
+          }
+          fs.writeFileSync("macos-isolation-validation/SIGNATURES.json", JSON.stringify({strictIntegrity: verified}, null, 2)+"\n");
+          if (!verified.official || !verified.workbench) process.exitCode = 1;
+          JS
+          node scripts/verify-macos-workbench-isolation.ts --official-executable "$official_installed/Contents/MacOS/$official_executable" --workbench-executable "$workbench_installed/Contents/MacOS/$workbench_executable" --workbench-version "$BUILD_VERSION" --artifacts-dir macos-isolation-validation
+      - name: Upload fixed isolation evidence only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workbench-macos-built-default-paths-and-coexistence
+          path: |
+            macos-isolation-validation/RESULT.json
+            macos-isolation-validation/SOURCE-DIGESTS.json
+            macos-isolation-validation/SIGNATURES.json
+          if-no-files-found: ignore
           retention-days: 14

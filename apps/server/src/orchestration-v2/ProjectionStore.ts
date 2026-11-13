@@ -46,6 +46,7 @@ import type {
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
+  TeamPlan,
 } from "@t3tools/contracts";
 import {
   IDLE_COMPACTION_TEXT,
@@ -66,6 +67,7 @@ import {
   OrchestrationV2RuntimeRequestJson as OrchestrationV2RuntimeRequestJsonSchema,
   OrchestrationV2SubagentJson as OrchestrationV2SubagentJsonSchema,
   OrchestrationV2TurnItemJson as OrchestrationV2TurnItemJsonSchema,
+  TeamPlan as TeamPlanSchema,
   orchestrationV2RunWorkStartedAt,
   RunId,
   MessageId,
@@ -592,6 +594,9 @@ export interface ProjectionStoreV2Shape {
   readonly getThread: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2AppThread, ProjectionStoreV2Error>;
+  readonly getTeamPlan: (
+    threadId: ThreadId,
+  ) => Effect.Effect<TeamPlan | null, ProjectionStoreV2Error>;
   readonly getLimitRecoveryCandidates: (options: {
     readonly now: DateTime.Utc;
     readonly autoResume: boolean;
@@ -852,6 +857,7 @@ export function emptyProjection(
     runtimeRequests: [],
     messages: [],
     plans: [],
+    teamPlan: null,
     turnItems: [],
     checkpointScopes: [],
     checkpoints: [],
@@ -893,7 +899,6 @@ export function applyToProjection(
     case "thread.created":
     case "thread.archived":
     case "thread.unarchived":
-    case "thread.deleted":
     case "thread.settled":
     case "thread.unsettled":
     case "thread.snoozed":
@@ -912,6 +917,8 @@ export function applyToProjection(
         ...base,
         thread: event.payload,
       };
+    case "thread.deleted":
+      return { ...base, thread: event.payload, teamPlan: null };
     // Reordering and PR refreshes preserve the orchestrator's activity timestamp.
     case "thread.active-reordered":
     case "thread.tags-updated":
@@ -1024,6 +1031,8 @@ export function applyToProjection(
         ...base,
         plans: upsertById(base.plans, event.payload),
       };
+    case "team-plan.updated":
+      return { ...base, teamPlan: event.payload.plan };
     case "checkpoint-scope.created":
       return {
         ...base,
@@ -1188,6 +1197,7 @@ const encodeMessagePayload = Schema.encodeEffect(
 const encodePlanPayload = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationV2PlanArtifactSchema),
 );
+const encodeTeamPlanPayload = Schema.encodeEffect(Schema.fromJsonString(TeamPlanSchema));
 export const encodeTurnItemPayload = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationV2TurnItemJsonSchema),
 );
@@ -1272,6 +1282,7 @@ const decodeMessagePayload = Schema.decodeUnknownEffect(
 const decodePlanJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2PlanArtifactSchema),
 );
+const decodeTeamPlanPayload = Schema.decodeUnknownEffect(Schema.fromJsonString(TeamPlanSchema));
 const decodeTurnItemPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2TurnItemJsonSchema),
 );
@@ -2225,6 +2236,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       { readonly sequence: number; readonly index: TimelineIndex }
     >();
 
+    const readTeamPlan = Effect.fn("ProjectionStore.readTeamPlan")(function* (threadId: ThreadId) {
+      const rows = yield* sql<PayloadRow>`
+        SELECT payload_json FROM orchestration_v2_projection_team_plans
+        WHERE thread_id = ${threadId}
+      `;
+      return rows[0] === undefined ? null : yield* decodeTeamPlanPayload(rows[0].payload_json);
+    });
+
     const apply: ProjectionStoreV2Shape["apply"] =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(
@@ -2313,6 +2332,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 deleted_at = excluded.deleted_at,
                 payload_json = excluded.payload_json
             `;
+              if (event.type === "thread.deleted") {
+                yield* sql`DELETE FROM orchestration_v2_projection_team_plans WHERE thread_id = ${event.threadId}`;
+              }
               break;
             }
             case "run.created":
@@ -2847,6 +2869,41 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 payload_json = excluded.payload_json
             `;
+              break;
+            }
+            case "team-plan.updated": {
+              if (
+                event.payload.threadId !== event.threadId ||
+                event.payload.plan.threadId !== event.threadId
+              ) {
+                return yield* new ProjectionStoreApplyEventError({ eventType: event.type });
+              }
+              yield* requireThread(event.threadId);
+              const payloadJson = yield* encodeTeamPlanPayload(event.payload.plan);
+              const updated = yield* sql<{ readonly thread_id: string }>`
+                INSERT INTO orchestration_v2_projection_team_plans (thread_id, version, payload_json)
+                SELECT ${event.threadId}, ${event.payload.plan.version}, ${payloadJson}
+                WHERE (${event.payload.plan.version} = 1 OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_team_plans
+                    WHERE thread_id = ${event.threadId}
+                  ))
+                  AND EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_threads
+                    WHERE thread_id = ${event.threadId} AND deleted_at IS NULL
+                  )
+                ON CONFLICT(thread_id) DO UPDATE SET
+                  version = excluded.version,
+                  payload_json = excluded.payload_json
+                WHERE orchestration_v2_projection_team_plans.version = excluded.version - 1
+                  OR (
+                    orchestration_v2_projection_team_plans.version = excluded.version
+                    AND orchestration_v2_projection_team_plans.payload_json = excluded.payload_json
+                  )
+                RETURNING thread_id
+              `;
+              if (updated.length !== 1) {
+                return yield* new ProjectionStoreApplyEventError({ eventType: event.type });
+              }
               break;
             }
             case "turn-item.updated": {
@@ -4298,6 +4355,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           for (const row of rows) messageOrdinals.set(row.message_id, row.ordinal);
         }
         const orderedMessages = sortMessagesByTurnItemOrder(messages, turnItems, messageOrdinals);
+        const teamPlan =
+          fields !== undefined && !fields.includes("teamPlan")
+            ? null
+            : yield* readTeamPlan(threadId);
         const projection = {
           thread,
           runs,
@@ -4310,6 +4371,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           runtimeRequests,
           messages: orderedMessages,
           plans,
+          teamPlan,
           turnItems,
           checkpointScopes,
           checkpoints,
@@ -4921,6 +4983,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           },
           { name: "plans", id: "plan_id", decode: (payload) => decodePlanJson(payload) },
           {
+            name: "team_plans",
+            id: "thread_id",
+            decode: (payload) => decodeTeamPlanPayload(payload),
+          },
+          {
             name: "turn_items",
             id: "turn_item_id",
             decode: (payload) => decodeTurnItemPayload(payload),
@@ -5527,6 +5594,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       isProjectionStoreThreadNotFoundError(cause)
         ? cause
         : new ProjectionStoreReadError({ threadId, cause });
+
+    const getTeamPlan: ProjectionStoreV2Shape["getTeamPlan"] = Effect.fn(
+      "ProjectionStore.getTeamPlan",
+    )(
+      function* (threadId) {
+        yield* requireThread(threadId);
+        return yield* readTeamPlan(threadId);
+      },
+      (effect, threadId) => effect.pipe(Effect.mapError(controlReadError(threadId))),
+    );
 
     const getPendingNativeUserInputs: ProjectionStoreV2Shape["getPendingNativeUserInputs"] = (
       threadId,
@@ -8964,6 +9041,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadShell: readOnReader(getThreadShell),
       findGuestShareThreadId: readOnReader(findGuestShareThreadId),
       getThread: readOnReader(getThread),
+      getTeamPlan: readOnReader(getTeamPlan),
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadTitles: readOnReader(getThreadTitles),

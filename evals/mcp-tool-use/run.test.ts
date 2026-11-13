@@ -10,6 +10,7 @@ import { assert, expect, it } from "@effect/vitest";
 import {
   ComposerContextId,
   EnvironmentId,
+  OrchestratorMcpTeamPlanResult,
   PreviewAutomationUnavailableError,
   ThreadId,
 } from "@t3tools/contracts";
@@ -44,6 +45,7 @@ import {
 } from "./run.ts";
 import { briefRoute, gradeDevice, shellInvocations } from "./device-grading.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
+import { buildTeamCoordinatorPrompt } from "../../apps/web/src/components/chat/teamCoordinatorPrompt.ts";
 
 it("grades Codex shell and subagent calls with the shared rules", () => {
   const calls = [
@@ -4688,5 +4690,116 @@ it.each([
       finalText: `Agent device access is off. ${instruction} Start a new agent session.`,
     }),
     [],
+  );
+});
+
+const teamCases = () =>
+  NodeFS.readFileSync(new URL("./cases/team-coordinator.ndjson", import.meta.url), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => decodeDeviceCase(line));
+
+it("builds team coordinator requests from the product builder and validates plan fixture results", () => {
+  const base = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
+  const workflowText = NodeFS.readFileSync(
+    new URL("../../integrations/pstack/t3-team.md", import.meta.url),
+    "utf8",
+  );
+  const decodeResult = Schema.decodeUnknownSync(OrchestratorMcpTeamPlanResult);
+  const cases = teamCases();
+  assert.equal(cases.length, 4);
+  for (const testCase of cases) {
+    const sample = makeSample(testCase, base);
+    const coordinator = testCase.setup.teamCoordinatorPrompt;
+    if (coordinator !== undefined) {
+      const expected = buildTeamCoordinatorPrompt({ ...coordinator, workflowText });
+      assert.equal(sample.testCase.prompt, expected);
+      assert.equal(buildMessages(sample).at(-1)?.content.at(-1)?.text, expected);
+    }
+    const result = testCase.setup.mocks?.team_plan;
+    const results =
+      result !== null &&
+      typeof result === "object" &&
+      "$sequence" in result &&
+      Array.isArray(result.$sequence)
+        ? result.$sequence
+        : [result];
+    for (const entry of results) decodeResult(entry);
+  }
+  const prepare = cases[0]!;
+  assert.throws(
+    () => makeSample({ ...prepare, prompt: "A duplicated coordinator prompt" }, base),
+    /empty prompt/,
+  );
+  assert.throws(
+    () => makeSample({ ...prepare, setup: { ...prepare.setup, role: "delegated-child" } }, base),
+    /top-level/,
+  );
+});
+
+it("rejects early dispatch, duplicate task revisions and child plan mutation in team cases", () => {
+  const cases = teamCases();
+  const find = (id: string) => cases.find((testCase) => testCase.id === id)!;
+  const call = (tool: string, input: unknown) => ({ tool, input });
+  const run = (...calls: Array<{ tool: string; input: unknown }>): SampleRun => ({
+    calls: calls.map((entry, step) => ({ ...entry, step })),
+    text: "Draft ready for UI confirmation.",
+    finalText: "Draft ready for UI confirmation.",
+    stopReason: "end_turn",
+  });
+  const read = call("team_plan", { action: "read" });
+  const draft = call("team_plan", {
+    action: "patch",
+    expectedPlanVersion: 0,
+    operations: [
+      { type: "set_goal", goal: "Read two fixture files" },
+      { type: "add_task", task: { taskId: "T1" } },
+      { type: "add_task", task: { taskId: "T2" } },
+    ],
+  });
+  const delegate = (taskId: string, revision = 1) =>
+    call("delegate_task", { planTaskRef: { taskId, revision } });
+  const prepare = find("team-prepare-persists-draft-before-confirmation");
+  assert.deepEqual(failed(prepare.expect, run(read, draft)), []);
+  assert.include(
+    failed(prepare.expect, run(read, draft, delegate("T1"))),
+    "notCalls delegate_task",
+  );
+  assert.isNotEmpty(failed(prepare.expect, run(read)));
+
+  const confirmed = find("team-continue-confirmed-dispatches-two-plan-revisions");
+  assert.deepEqual(failed(confirmed.expect, run(read, delegate("T1"), delegate("T2"))), []);
+  for (const bad of [
+    run(read, delegate("T1"), delegate("T1")),
+    run(read, delegate("T1", 2), delegate("T2")),
+    run(read, call("delegate_task", {}), delegate("T2")),
+    run(delegate("T1"), read, delegate("T2")),
+    run(read, delegate("T1"), delegate("T2"), delegate("T1")),
+  ])
+    assert.isNotEmpty(failed(confirmed.expect, bad));
+
+  const unconfirmed = find("team-continue-unconfirmed-does-not-dispatch");
+  assert.deepEqual(failed(unconfirmed.expect, run(read)), []);
+  assert.include(failed(unconfirmed.expect, run(read, delegate("T1"))), "notCalls delegate_task");
+  for (const type of ["confirm_plan", "confirm_task", "bind_execution"]) {
+    assert.isNotEmpty(
+      failed(
+        unconfirmed.expect,
+        run(read, call("team_plan", { action: "patch", operations: [{ type }] })),
+      ),
+    );
+  }
+  const child = find("team-child-does-not-self-confirm-parent");
+  assert.deepEqual(failed(child.expect, run()), []);
+  assert.isNotEmpty(
+    failed(
+      child.expect,
+      run(
+        call("team_plan", {
+          action: "patch",
+          operations: [{ type: "set_goal", goal: "Overwrite parent" }],
+        }),
+      ),
+    ),
   );
 });
