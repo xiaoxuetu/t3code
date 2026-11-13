@@ -87,6 +87,7 @@ export function teamPlanTaskReadiness(
 ): { ready: boolean; reason: string | null } {
   const task = plan.tasks.find((entry) => entry.taskId === taskId);
   if (task === undefined) return { ready: false, reason: "missing-task" };
+  if (plan.dispatchPaused === true) return { ready: false, reason: "dispatch-paused" };
   if (!plan.goal.trim()) return { ready: false, reason: "missing-goal" };
   if (task.modelSelection === null || !task.modelSelection.model.trim())
     return { ready: false, reason: "unassigned-model" };
@@ -115,6 +116,7 @@ export function validateTeamPlan(plan: TeamPlan): TeamPlanPatchFailure | null {
     plan.version < 0 ||
     !Number.isSafeInteger(plan.revision) ||
     plan.revision < 1 ||
+    (plan.dispatchPaused !== undefined && typeof plan.dispatchPaused !== "boolean") ||
     (plan.confirmedRevision !== null && plan.confirmedRevision !== plan.revision)
   )
     return { code: "invalid-operation" };
@@ -230,6 +232,11 @@ export function applyTeamPlanPatch(
       plan.confirmedRevision = null;
     };
     for (const operation of patch.operations) {
+      if (operation.type === "set_dispatch_paused") {
+        if (typeof operation.paused !== "boolean") return reject("invalid-operation");
+        plan.dispatchPaused = operation.paused;
+        continue;
+      }
       if (operation.type === "set_goal") {
         if (!operation.goal.trim()) return reject("invalid-operation");
         if (plan.goal !== operation.goal) {

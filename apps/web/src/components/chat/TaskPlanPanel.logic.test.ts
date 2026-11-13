@@ -15,6 +15,7 @@ import {
   taskPlanDraftOperations,
   taskPlanDependencyLabel,
   taskPlanHistoricalExecutions,
+  taskPlanCoordinatorPatch,
 } from "./TaskPlanPanel.logic";
 
 const at = "2026-11-13T10:00:00.000Z";
@@ -54,6 +55,75 @@ function plan(tasks: ReadonlyArray<TeamPlanTask>): TeamPlan {
     updatedAt: at,
   };
 }
+
+it("pauses an existing confirmed plan before refining its unchanged goal", () => {
+  const current = plan([task()]);
+  const snapshot = structuredClone(current);
+  expect(
+    taskPlanCoordinatorPatch(current, { phase: "prepare", goal: ` ${current.goal} ` }),
+  ).toEqual({
+    ok: true,
+    goal: current.goal,
+    patch: {
+      expectedPlanVersion: current.version,
+      operations: [{ type: "set_dispatch_paused", paused: true }],
+    },
+  });
+  expect(current).toEqual(snapshot);
+});
+
+it("saves a new goal and pauses dispatch in one versioned plan write", () => {
+  expect(taskPlanCoordinatorPatch(null, { phase: "prepare", goal: " Inspect samples " })).toEqual({
+    ok: true,
+    goal: "Inspect samples",
+    patch: {
+      expectedPlanVersion: 0,
+      operations: [
+        { type: "set_goal", goal: "Inspect samples" },
+        { type: "set_dispatch_paused", paused: true },
+      ],
+    },
+  });
+});
+
+it("resumes a paused confirmed plan without revising or reissuing its existing work", () => {
+  const current = { ...plan([task()]), dispatchPaused: true };
+  const snapshot = structuredClone(current);
+  expect(taskPlanCoordinatorPatch(current, { phase: "continue" })).toEqual({
+    ok: true,
+    goal: current.goal,
+    patch: {
+      expectedPlanVersion: current.version,
+      operations: [{ type: "set_dispatch_paused", paused: false }],
+    },
+  });
+  expect(current).toEqual(snapshot);
+});
+
+it("avoids another plan mutation when the requested dispatch state already applies", () => {
+  const current = plan([task()]);
+  expect(
+    taskPlanCoordinatorPatch(
+      { ...current, dispatchPaused: true },
+      { phase: "prepare", goal: current.goal },
+    ),
+  ).toEqual({ ok: true, goal: current.goal, patch: null });
+  expect(taskPlanCoordinatorPatch(current, { phase: "continue" })).toEqual({
+    ok: true,
+    goal: current.goal,
+    patch: null,
+  });
+});
+
+it.each([
+  null,
+  plan([]),
+  { ...plan([task()]), goal: " " },
+  { ...plan([task()]), confirmedRevision: null },
+  { ...plan([task()]), confirmedRevision: 2 },
+])("requires a nonempty confirmed task plan before resuming dispatch", (current) => {
+  expect(taskPlanCoordinatorPatch(current, { phase: "continue" }).ok).toBe(false);
+});
 
 it("changes priority without revising content, clearing the executor, or touching a dispatched attempt", () => {
   const original = task();

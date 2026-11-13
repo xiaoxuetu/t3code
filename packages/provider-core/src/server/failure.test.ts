@@ -91,6 +91,11 @@ it("preserves actionable T3 errors wrapped by turn startup", () => {
   for (const error of [
     new ContextHandoffBudgetError(),
     new ContextHandoffBackgroundWorkError(),
+    {
+      _tag: "AcpConfigurationSelectionError",
+      message: "The agent could not apply an explicitly requested configuration option.",
+      cause: new Error("private provider rejection detail"),
+    },
     new ProviderSetupError({
       instanceId: ProviderInstanceId.make("codex"),
       operation: "runtime",

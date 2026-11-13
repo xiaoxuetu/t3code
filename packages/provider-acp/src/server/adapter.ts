@@ -283,6 +283,25 @@ class AcpModelSelectionError extends Schema.TaggedError<AcpModelSelectionError>(
   }
 }
 
+class AcpConfigurationSelectionError extends Schema.TaggedError<AcpConfigurationSelectionError>()(
+  "AcpConfigurationSelectionError",
+  {
+    optionId: Schema.String,
+    reason: Schema.Literals([
+      "unavailable",
+      "unsupported_value",
+      "rejected",
+      "policy_limit",
+      "not_applied",
+    ]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return "The agent could not apply an explicitly requested configuration option. Choose an available option for this session, then retry.";
+  }
+}
+
 /**
  * Maps one per-turn usage sample (flavors with reportsPerTurnPromptUsage)
  * directly onto TurnTokenUsage: the response's counters already cover exactly
@@ -7359,14 +7378,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
 
         const validateModelSelection = Effect.fn("AcpAdapterV2.validateModelSelection")(function* (
           modelSelection: ModelSelection,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
         ) {
           const model = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
+          const strict = runtimePolicy.selectionPolicy === "strict";
           if (
-            flavor.applyModelSelection !== undefined ||
+            (!strict && flavor.applyModelSelection !== undefined) ||
             model.length === 0 ||
             model === "default" ||
             model === "auto" ||
-            flavor.customModels?.includes(model) === true
+            (!strict && flavor.customModels?.includes(model) === true)
           )
             return;
           const option = findModelConfigOption(yield* runtime.getConfigOptions);
@@ -7375,7 +7396,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             option?.type === "select"
               ? flattenSelectChoices(option.options).some((choice) => choice.value === model)
               : models?.availableModels.some((choice) => choice.modelId === model);
-          if (available === false) {
+          if (available === false || (strict && available !== true)) {
             return yield* new AcpModelSelectionError({
               model: modelSelection.model,
               cause: EffectAcpErrors.AcpRequestError.invalidParams(
@@ -7392,7 +7413,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           unsetOptionDefaults: NonNullable<ModelSelection["options"]> = [],
         ) {
           yield* Ref.set(activeSelection, null);
-          yield* validateModelSelection(modelSelection);
+          yield* validateModelSelection(modelSelection, runtimePolicy);
+          const strict = runtimePolicy.selectionPolicy === "strict";
           const requestedModel = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
           // Invalid params is the agent refusing the value, and the runtime
           // raises the same code when the session's model option does not offer
@@ -7442,6 +7464,20 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               appliedModel = requestedModel;
             }
           }
+          if (
+            strict &&
+            requestedModel.length > 0 &&
+            requestedModel !== "default" &&
+            requestedModel !== "auto" &&
+            appliedModel !== requestedModel
+          ) {
+            return yield* new AcpModelSelectionError({
+              model: modelSelection.model,
+              cause: EffectAcpErrors.AcpRequestError.invalidParams(
+                "The session did not apply the requested model.",
+              ),
+            });
+          }
           if (appliedModel !== undefined) {
             const applied = appliedModel;
             yield* Ref.update(activeSessionSetup, (setup) => {
@@ -7483,6 +7519,42 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             return granted !== undefined && !isRuntimeModeAbove(granted, ceiling);
           };
           const explicitSelections = modelSelection.options ?? [];
+          // Descriptor probes can union several models. A plan-bound execution must prove each
+          // explicit choice against this live session; implicit defaults retain compatibility.
+          if (strict) {
+            const modeState = yield* runtime.getModeState;
+            for (const selection of explicitSelections) {
+              if (!withinCeiling(selection)) {
+                return yield* new AcpConfigurationSelectionError({
+                  optionId: selection.id,
+                  reason: "policy_limit",
+                });
+              }
+              const option = configOptions.find((candidate) => candidate.id === selection.id);
+              if (option === undefined) {
+                if (
+                  selection.id === ACP_SESSION_MODE_OPTION_ID &&
+                  modeState?.availableModes.some((mode) => mode.id === selection.value) === true
+                )
+                  continue;
+                return yield* new AcpConfigurationSelectionError({
+                  optionId: selection.id,
+                  reason: "unavailable",
+                });
+              }
+              const value = selection.value === ACP_EMPTY_OPTION_VALUE ? "" : selection.value;
+              if (
+                flavor.ownedModelOptionIds?.includes(selection.id) === true ||
+                (option.type === "select" &&
+                  !flattenSelectChoices(option.options).some((choice) => choice.value === value))
+              ) {
+                return yield* new AcpConfigurationSelectionError({
+                  optionId: selection.id,
+                  reason: "unsupported_value",
+                });
+              }
+            }
+          }
           const implicitSelections = unsetOptionDefaults.filter(
             (implicit) => !explicitSelections.some((selection) => selection.id === implicit.id),
           );
@@ -7539,11 +7611,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.catchTags({
                 AcpRequestError: (error) =>
                   error.code === -32602
-                    ? Effect.logWarning("ACP session rejected a configuration option value", {
-                        optionId: selection.id,
-                        value: selection.value,
-                        detail: error.message,
-                      })
+                    ? strict && explicitSelections.some((explicit) => explicit.id === selection.id)
+                      ? Effect.fail(
+                          new AcpConfigurationSelectionError({
+                            optionId: selection.id,
+                            reason: "rejected",
+                            cause: error,
+                          }),
+                        )
+                      : Effect.logWarning("ACP session rejected a configuration option value", {
+                          optionId: selection.id,
+                          value: selection.value,
+                          detail: error.message,
+                        })
                     : Effect.fail(error),
               }),
             );
@@ -7638,7 +7718,41 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               nativeBuildConfigurationBySessionId.delete(startResult.sessionId);
             }
           }
-          yield* validateModelSelection(modelSelection);
+          yield* validateModelSelection(modelSelection, runtimePolicy);
+          if (strict) {
+            const finalConfigOptions = yield* runtime.getConfigOptions;
+            const finalModeState = yield* runtime.getModeState;
+            const modelOption = findModelConfigOption(finalConfigOptions);
+            if (
+              requestedModel.length > 0 &&
+              requestedModel !== "default" &&
+              requestedModel !== "auto" &&
+              modelOption?.type === "select" &&
+              modelOption.currentValue !== requestedModel
+            ) {
+              return yield* new AcpModelSelectionError({
+                model: modelSelection.model,
+                cause: EffectAcpErrors.AcpRequestError.invalidParams(
+                  "The session did not retain the requested model.",
+                ),
+              });
+            }
+            for (const selection of explicitSelections) {
+              const option = finalConfigOptions.find((candidate) => candidate.id === selection.id);
+              const currentValue =
+                option === undefined && selection.id === ACP_SESSION_MODE_OPTION_ID
+                  ? finalModeState?.currentModeId
+                  : option?.currentValue;
+              const requestedValue =
+                selection.value === ACP_EMPTY_OPTION_VALUE ? "" : selection.value;
+              if (currentValue !== requestedValue) {
+                return yield* new AcpConfigurationSelectionError({
+                  optionId: selection.id,
+                  reason: "not_applied",
+                });
+              }
+            }
+          }
           yield* (
             flavor.onSessionConfigurationUpdate?.(
               yield* runtime.getConfigOptions,
@@ -8283,6 +8397,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const configuredSelection = yield* Ref.get(activeSelection);
               const configuredInteractionMode = yield* Ref.get(activeInteractionMode);
               if (
+                turnInput.runtimePolicy.selectionPolicy === "strict" ||
                 configuredSelection === null ||
                 !modelSelectionsEqual(configuredSelection, turnInput.modelSelection) ||
                 configuredInteractionMode !== turnInput.runtimePolicy.interactionMode
@@ -8319,7 +8434,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 providerThreadId: turnInput.providerThread.id,
               });
             }
-            yield* validateModelSelection(turnInput.modelSelection);
+            yield* validateModelSelection(turnInput.modelSelection, turnInput.runtimePolicy);
             yield* Ref.set(lastTurnRoute, {
               threadId: turnInput.threadId,
               providerThreadId: turnInput.providerThread.id,

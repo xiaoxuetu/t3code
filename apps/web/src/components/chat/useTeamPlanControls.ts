@@ -20,6 +20,7 @@ import { useEnvironmentScope } from "../../state/session";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { TaskPlanPanelControls } from "./TaskPlanPanel";
+import { taskPlanCoordinatorPatch } from "./TaskPlanPanel.logic";
 import { buildTeamCoordinatorPrompt } from "./teamCoordinatorPrompt";
 
 /** Plan writes and coordinator turns use the existing authenticated T3 command paths. */
@@ -138,22 +139,24 @@ export function useTeamPlanControls(input: {
     canOpenExecution: environment?.connection.phase === "connected",
     onPatch,
     onPrepare: async (goal) => {
-      const trimmed = goal.trim();
-      if (!trimmed) throw new Error("Enter the team's goal.");
+      const request = taskPlanCoordinatorPatch(plan, { phase: "prepare", goal });
+      if (!request.ok) throw new Error(request.message);
       coordinatorSelection();
-      if (plan?.goal !== trimmed) {
-        const result = await onPatch({
-          expectedPlanVersion: plan?.version ?? 0,
-          operations: [{ type: "set_goal", goal: trimmed }],
-        });
+      if (request.patch !== null) {
+        const result = await onPatch(request.patch);
         if (!result.ok) throw new Error(result.message);
       }
-      await requestCoordinator("prepare", trimmed);
+      await requestCoordinator("prepare", request.goal);
     },
     onContinue: async () => {
-      if (plan === null || plan.tasks.length === 0 || plan.confirmedRevision !== plan.revision)
-        throw new Error("Review and confirm the current task plan before continuing the team.");
-      await requestCoordinator("continue", plan.goal);
+      coordinatorSelection();
+      const request = taskPlanCoordinatorPatch(plan, { phase: "continue" });
+      if (!request.ok) throw new Error(request.message);
+      if (request.patch !== null) {
+        const result = await onPatch(request.patch);
+        if (!result.ok) throw new Error(result.message);
+      }
+      await requestCoordinator("continue", request.goal);
     },
     onOpenExecution: (execution) => {
       if (environment?.connection.phase !== "connected") return;

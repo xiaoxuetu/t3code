@@ -43,6 +43,47 @@ function patch(plan: TeamPlan, operations: ReadonlyArray<TeamPlanOperation>): Te
 }
 const initial = () => createTeamPlan({ threadId, now, goal: "Deliver approved work" });
 
+it("pauses only new dispatch without changing confirmed scope, history or execution links", () => {
+  let plan = patch(initial(), [
+    { type: "add_task", task: draft("T1") },
+    { type: "add_task", task: draft("T2") },
+  ]);
+  plan = patch(plan, [{ type: "confirm_plan", revision: plan.revision }]);
+  plan = patch(plan, [
+    {
+      type: "bind_execution",
+      taskId: "T2",
+      revision: 1,
+      execution: {
+        subagentId: NodeId.make("existing-worker"),
+        threadId: ThreadId.make("existing-child"),
+        runId: RunId.make("existing-run"),
+      },
+    },
+    { type: "edit_task", taskId: "T2", changes: { prompt: "Proposed later scope" } },
+  ]);
+  plan = patch(plan, [{ type: "confirm_plan", revision: plan.revision }]);
+  const before = structuredClone(plan);
+  expect(plan).not.toHaveProperty("dispatchPaused");
+  expect(teamPlanTaskReadiness(plan, "T1")).toEqual({ ready: true, reason: null });
+  plan = patch(plan, [{ type: "set_dispatch_paused", paused: true }]);
+  expect(plan.dispatchPaused).toBe(true);
+  expect(plan.version).toBe(before.version + 1);
+  expect(plan.revision).toBe(before.revision);
+  expect(plan.confirmedRevision).toBe(before.confirmedRevision);
+  expect(plan.tasks).toEqual(before.tasks);
+  expect(teamPlanTaskReadiness(plan, "T1")).toEqual({
+    ready: false,
+    reason: "dispatch-paused",
+  });
+  plan = patch(plan, [{ type: "set_dispatch_paused", paused: false }]);
+  expect(plan.dispatchPaused).toBe(false);
+  expect(plan.version).toBe(before.version + 2);
+  expect(plan.revision).toBe(before.revision);
+  expect(plan.tasks).toEqual(before.tasks);
+  expect(teamPlanTaskReadiness(plan, "T1")).toEqual({ ready: true, reason: null });
+});
+
 it("uses plan-version CAS and leaves the prior state untouched", () => {
   const plan = initial();
   const result = applyTeamPlanPatch(

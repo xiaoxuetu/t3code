@@ -15,7 +15,7 @@ on:
         description: "Version for this macOS engineering preview"
         type: string
         required: true
-        default: "0.1.0-workbench.5"
+        default: "0.1.0-workbench.9"
 
 permissions:
   contents: read
@@ -126,12 +126,24 @@ jobs:
         working-directory: apps/server
         shell: bash
         run: |
-          vp test run --config vite.config.ts src/orchestration-v2/Orchestrator.teamPlan.test.ts src/orchestration-v2/Orchestrator.teamPlan-atomic.test.ts src/orchestration-v2/TeamPlanProjection.test.ts
+          vp test run --config vite.config.ts src/orchestration-v2/Orchestrator.teamPlan.test.ts src/orchestration-v2/Orchestrator.teamPlan-atomic.test.ts src/orchestration-v2/Orchestrator.teamPlan-pause.test.ts src/orchestration-v2/TeamPlanProjection.test.ts src/orchestration-v2/TeamPlanDependencyHandoff.test.ts
           vp test run --config vite.config.ts src/orchestration-v2/ThreadManagementService.test.ts -t 'stamps authoritative provenance'
       - name: Run synthetic coordinator MCP boundary checks
         working-directory: apps/server
         shell: bash
-        run: vp test run --config vite.config.ts src/mcp/OrchestratorMcpToolkit.integration.test.ts src/mcp/toolkits/orchestrator/tools.test.ts -t 'persists coordinator plans|owns team-plan metadata|states t3_thread_read|refuses a t3_thread_update|keeps team-plan confirmation'
+        run: |
+          vp test run --config vite.config.ts src/mcp/OrchestratorMcpToolkit.integration.test.ts src/mcp/toolkits/orchestrator/tools.test.ts -t 'persists coordinator plans|owns team-plan metadata|drives a scripted team|states t3_thread_read|refuses a t3_thread_update|keeps team-plan confirmation'
+          vp test run --config vite.config.ts src/mcp/OrchestratorMcpService.test.ts -t 'inherits delegated options|accepts the inherited options|validates options against'
+      - name: Run synthetic plan-linked provider selection checks
+        working-directory: apps/server
+        shell: bash
+        run: |
+          vp test run --config vite.config.ts src/orchestration-v2/TeamPlanSelectionPolicy.test.ts src/orchestration-v2/ProviderTurnStartService.test.ts
+          vp test run --config vite.config.ts src/orchestration-v2/Adapters/AcpAdapterV2.test.ts -t 'selection handles|strict selection revalidates|selection keeps native mode|reapplies a selection'
+      - name: Run provider selection failure message checks
+        working-directory: packages/provider-core
+        shell: bash
+        run: vp test run src/server/failure.test.ts
       - name: Run focused build and development regression tests
         working-directory: scripts
         shell: bash

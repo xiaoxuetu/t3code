@@ -2647,6 +2647,470 @@ describe("AcpAdapterV2", () => {
       }).pipe(Effect.provide(layerTest)),
   );
 
+  it.live.each(
+    [
+      {
+        name: "a concrete model without a live catalog",
+        configuration: "missing-catalog",
+        rejectsStrict: true,
+      },
+      {
+        name: "an explicit effort missing from live configuration",
+        configuration: "missing-option",
+        rejectsStrict: true,
+      },
+      {
+        name: "an unadvertised explicit effort value",
+        configuration: "unlisted-option",
+        rejectsStrict: true,
+      },
+      {
+        name: "a rejected explicit effort value",
+        configuration: "rejected-option",
+        rejectsStrict: true,
+      },
+      {
+        name: "an available explicit effort value",
+        configuration: "available-option",
+        rejectsStrict: false,
+      },
+      {
+        name: "an explicit effort overwritten by native policy configuration",
+        configuration: "overwritten-option",
+        rejectsStrict: true,
+      },
+      {
+        name: "an acknowledged but unapplied explicit effort",
+        configuration: "ignored-option",
+        rejectsStrict: true,
+      },
+      {
+        name: "an acknowledged but unapplied concrete model",
+        configuration: "ignored-model",
+        rejectsStrict: true,
+      },
+      {
+        name: "an undefined custom model application",
+        configuration: "undefined-custom-application",
+        rejectsStrict: true,
+      },
+      {
+        name: "an unavailable implicit default",
+        configuration: "implicit-option",
+        rejectsStrict: false,
+      },
+    ].flatMap((scenario) => [
+      { ...scenario, policy: "strict" as const },
+      { ...scenario, policy: "compatible" as const },
+    ]),
+  )(
+    "$policy selection handles $name before prompting",
+    ({ configuration, rejectsStrict, policy }) =>
+      Effect.gen(function* () {
+        const instanceId = ProviderInstanceId.make("acp-test-strict-selection");
+        const threadId = ThreadId.make("thread-acp-strict-selection");
+        const omitModels = configuration === "missing-catalog";
+        const implicit = configuration === "implicit-option";
+        const hasThinking = [
+          "unlisted-option",
+          "rejected-option",
+          "available-option",
+          "overwritten-option",
+          "ignored-option",
+        ].includes(configuration);
+        let prompts = 0;
+        let thinking = "low";
+        let promptedThinking: string | undefined;
+        let promptedModel: string | undefined;
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            ...(implicit
+              ? { unsetOptionDefaults: Effect.succeed([{ id: "thinking_level", value: "high" }]) }
+              : {}),
+            ...(configuration === "overwritten-option"
+              ? {
+                  sessionConfigForPolicy: () => [{ id: "thinking_level", value: "low" }],
+                }
+              : {}),
+            ...(configuration === "undefined-custom-application"
+              ? {
+                  applyModelSelection: () => Effect.undefined,
+                }
+              : {}),
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+              mockAgentPath: yield* bundledMockAgentPath,
+              wrapRuntime: (runtime) => {
+                const getConfigOptions = omitModels
+                  ? Effect.succeed([])
+                  : runtime.getConfigOptions.pipe(
+                      Effect.map((native): ReadonlyArray<EffectAcpSchema.SessionConfigOption> =>
+                        hasThinking
+                          ? [
+                              ...native,
+                              {
+                                id: "thinking_level",
+                                name: "Thinking level",
+                                type: "select",
+                                currentValue: thinking,
+                                options:
+                                  configuration === "unlisted-option"
+                                    ? [{ value: "low", name: "Low" }]
+                                    : [
+                                        { value: "low", name: "Low" },
+                                        { value: "high", name: "High" },
+                                      ],
+                              },
+                            ]
+                          : native,
+                      ),
+                    );
+                return {
+                  ...runtime,
+                  start: () =>
+                    runtime.start().pipe(
+                      Effect.map((started) => {
+                        if (!omitModels) return started;
+                        const {
+                          models: _models,
+                          configOptions: _config,
+                          ...setup
+                        } = started.sessionSetupResult;
+                        return { ...started, sessionSetupResult: setup };
+                      }),
+                    ),
+                  getConfigOptions,
+                  setConfigOption: (id, value, options) =>
+                    id === "model" && configuration === "ignored-model"
+                      ? getConfigOptions.pipe(Effect.map((configOptions) => ({ configOptions })))
+                      : id !== "thinking_level"
+                        ? runtime.setConfigOption(id, value, options)
+                        : configuration === "rejected-option"
+                          ? Effect.fail(
+                              EffectAcpErrors.AcpRequestError.invalidParams(
+                                "Synthetic option rejection",
+                              ),
+                            )
+                          : Effect.sync(() => {
+                              if (configuration !== "ignored-option") thinking = String(value);
+                            }).pipe(
+                              Effect.andThen(getConfigOptions),
+                              Effect.map((configOptions) => ({ configOptions })),
+                            ),
+                  prompt: () =>
+                    Effect.gen(function* () {
+                      prompts += 1;
+                      promptedThinking = hasThinking ? thinking : undefined;
+                      const model = (yield* getConfigOptions).find(
+                        (option) => option.id === "model",
+                      );
+                      promptedModel = model?.type === "select" ? model.currentValue : undefined;
+                      return { stopReason: "end_turn" as const };
+                    }),
+                };
+              },
+            }),
+          },
+        });
+        const runtimePolicy = {
+          ...ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          }),
+          selectionPolicy: policy,
+        };
+        const modelSelection = {
+          instanceId,
+          model: omitModels ? "required-model-without-catalog" : "composer-2",
+          options:
+            omitModels ||
+            implicit ||
+            configuration === "ignored-model" ||
+            configuration === "undefined-custom-application"
+              ? []
+              : [{ id: "thinking_level", value: "high" }],
+        } satisfies ModelSelection;
+        const result = yield* Effect.exit(
+          Effect.gen(function* () {
+            const runtime = yield* adapter.openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make("provider-session-acp-strict-selection"),
+              modelSelection,
+              runtimePolicy,
+            });
+            const providerThread = yield* runtime.ensureThread({
+              threadId,
+              modelSelection,
+              runtimePolicy,
+            });
+            yield* runtime.startTurn(
+              makeTurnInput({
+                threadId,
+                providerThread,
+                instanceId,
+                modelSelection,
+                runtimePolicy,
+                now: yield* DateTime.now,
+              }),
+            );
+            yield* runtime.events.pipe(
+              Stream.takeUntil((event) => event.type === "turn.terminal"),
+              Stream.runDrain,
+            );
+          }),
+        );
+        if (policy === "strict" && rejectsStrict) {
+          assert.equal(prompts, 0, "an unmet explicit selection must not reach the agent");
+          assert.isTrue(
+            Exit.isFailure(result),
+            "strict selection must fail instead of using defaults",
+          );
+        } else {
+          assert.isTrue(
+            Exit.isSuccess(result),
+            Exit.isFailure(result) ? Cause.pretty(result.cause) : "",
+          );
+          assert.equal(prompts, 1, "compatible selection retains the existing default behavior");
+          if (configuration === "available-option") assert.equal(promptedThinking, "high");
+          if (configuration === "overwritten-option" || configuration === "ignored-option")
+            assert.equal(promptedThinking, "low");
+          if (configuration === "ignored-model" || configuration === "undefined-custom-application")
+            assert.equal(promptedModel, "default");
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.each([
+    "same selection after compatible",
+    "removed live option",
+    "changed current value",
+  ] as const)("strict selection revalidates a later turn with %s", (transition) =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("acp-test-strict-revalidation");
+      const threadId = ThreadId.make("thread-acp-strict-revalidation");
+      let exposeThinking = transition !== "same selection after compatible";
+      let thinking = "low";
+      const promptedThinking: Array<string | undefined> = [];
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+            mockAgentPath: yield* bundledMockAgentPath,
+            wrapRuntime: (runtime) => {
+              const getConfigOptions = runtime.getConfigOptions.pipe(
+                Effect.map((native): ReadonlyArray<EffectAcpSchema.SessionConfigOption> =>
+                  exposeThinking
+                    ? [
+                        ...native,
+                        {
+                          id: "thinking_level",
+                          name: "Thinking level",
+                          type: "select",
+                          currentValue: thinking,
+                          options: [
+                            { value: "low", name: "Low" },
+                            { value: "high", name: "High" },
+                          ],
+                        },
+                      ]
+                    : native,
+                ),
+              );
+              return {
+                ...runtime,
+                getConfigOptions,
+                setConfigOption: (id, value, options) =>
+                  id !== "thinking_level"
+                    ? runtime.setConfigOption(id, value, options)
+                    : Effect.sync(() => {
+                        thinking = String(value);
+                      }).pipe(
+                        Effect.andThen(getConfigOptions),
+                        Effect.map((configOptions) => ({ configOptions })),
+                      ),
+                prompt: () =>
+                  Effect.sync(() => {
+                    promptedThinking.push(exposeThinking ? thinking : undefined);
+                    return { stopReason: "end_turn" as const };
+                  }),
+              };
+            },
+          }),
+        },
+      });
+      const initialPolicy = {
+        ...ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        }),
+        selectionPolicy:
+          transition === "same selection after compatible"
+            ? ("compatible" as const)
+            : ("strict" as const),
+      };
+      const modelSelection = {
+        instanceId,
+        model: "composer-2",
+        options: [{ id: "thinking_level", value: "high" }],
+      } satisfies ModelSelection;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-strict-revalidation"),
+        modelSelection,
+        runtimePolicy: initialPolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: initialPolicy,
+      });
+      const now = yield* DateTime.now;
+      const runTurn = (
+        ordinal: number,
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+      ) =>
+        runtime
+          .startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              modelSelection,
+              runtimePolicy,
+              now,
+              ordinal,
+            }),
+          )
+          .pipe(
+            Effect.andThen(
+              runtime.events.pipe(
+                Stream.takeUntil((event) => event.type === "turn.terminal"),
+                Stream.runDrain,
+              ),
+            ),
+          );
+      yield* runTurn(1, initialPolicy);
+      assert.lengthOf(promptedThinking, 1);
+      if (transition === "removed live option") exposeThinking = false;
+      if (transition === "changed current value") thinking = "low";
+      const result = yield* Effect.exit(
+        runTurn(2, { ...initialPolicy, selectionPolicy: "strict" }),
+      );
+      if (transition === "changed current value") {
+        assert.isTrue(
+          Exit.isSuccess(result),
+          Exit.isFailure(result) ? Cause.pretty(result.cause) : "",
+        );
+        assert.deepEqual(
+          promptedThinking,
+          ["high", "high"],
+          "a reused selection must restore the requested live value before another prompt",
+        );
+      } else {
+        assert.isTrue(Exit.isFailure(result));
+        const error = Exit.isFailure(result) ? Cause.squash(result.cause) : undefined;
+        assert.instanceOf(error, ProviderAdapter.ProviderAdapterTurnStartError);
+        assert.lengthOf(promptedThinking, 1, "a cached selection cannot bypass strict validation");
+      }
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live.each(["strict", "compatible"] as const)(
+    "%s selection keeps native mode under the policy ceiling",
+    (selectionPolicy) =>
+      Effect.gen(function* () {
+        const instanceId = ProviderInstanceId.make("acp-test-selection-ceiling");
+        const threadId = ThreadId.make("thread-acp-selection-ceiling");
+        const promptedModes: Array<string | undefined> = [];
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            runtimeModeForSessionMode: (mode) =>
+              mode === "code" ? "full-access" : mode === "ask" ? "approval-required" : undefined,
+            sessionModeForPolicy: () => "ask",
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+              mockAgentPath: yield* bundledMockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                prompt: () =>
+                  Effect.gen(function* () {
+                    promptedModes.push((yield* runtime.getModeState)?.currentModeId);
+                    return { stopReason: "end_turn" as const };
+                  }),
+              }),
+            }),
+          },
+        });
+        const runtimePolicy = {
+          ...ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "approval-required",
+            maxRuntimeMode: "approval-required",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          }),
+          selectionPolicy,
+        };
+        const modelSelection = {
+          instanceId,
+          model: "composer-2",
+          options: [{ id: "mode", value: "code" }],
+        } satisfies ModelSelection;
+        const result = yield* Effect.exit(
+          Effect.gen(function* () {
+            const runtime = yield* adapter.openSession({
+              threadId,
+              providerSessionId: ProviderSessionId.make("provider-session-acp-selection-ceiling"),
+              modelSelection,
+              runtimePolicy,
+            });
+            const providerThread = yield* runtime.ensureThread({
+              threadId,
+              modelSelection,
+              runtimePolicy,
+            });
+            yield* runtime.startTurn(
+              makeTurnInput({
+                threadId,
+                providerThread,
+                instanceId,
+                modelSelection,
+                runtimePolicy,
+                now: yield* DateTime.now,
+              }),
+            );
+            yield* runtime.events.pipe(
+              Stream.takeUntil((event) => event.type === "turn.terminal"),
+              Stream.runDrain,
+            );
+          }),
+        );
+        if (selectionPolicy === "strict") {
+          assert.isTrue(Exit.isFailure(result));
+          assert.deepEqual(promptedModes, []);
+        } else {
+          assert.isTrue(
+            Exit.isSuccess(result),
+            Exit.isFailure(result) ? Cause.pretty(result.cause) : "",
+          );
+          assert.deepEqual(promptedModes, ["ask"]);
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
+
   it.live("reapplies a selection after a switch away from it failed partway", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

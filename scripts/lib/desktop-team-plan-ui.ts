@@ -30,6 +30,9 @@ export const DESKTOP_TEAM_PLAN_EXPECTED = {
     "List synthetic package scripts only. This metadata fixture must not execute.",
   originalSecondPriority: 20,
   confirmed: false,
+  dispatchPaused: true,
+  planVersion: 7,
+  planRevision: 5,
   historicalRevisionCount: 1,
 } as const;
 
@@ -40,6 +43,7 @@ const METADATA_BUTTONS = new Set([
   "Edit task",
   "Save task",
   "Confirm plan",
+  "Pause new tasks",
 ]);
 
 export function isDesktopTeamPlanMetadataButton(name: string): boolean {
@@ -144,6 +148,7 @@ export interface DesktopTeamPlanSavedVerification {
   readonly stableTaskIds: true;
   readonly historicalRevisionCount: 1;
   readonly executionRecordCount: 0;
+  readonly dispatchPausedVisible: true;
 }
 
 /** Reads only the synthetic plan after opening its view; it never submits a plan or agent message. */
@@ -154,7 +159,13 @@ export async function assertSavedDesktopTeamPlan(
     await requireFixture(page);
     const plan = await openTaskPlan(page);
     await visible(plan.getByText(DESKTOP_TEAM_PLAN_EXPECTED.goal, { exact: true }));
-    await visible(plan.getByText(/^Plan r\d+\s*·\s*Needs confirmation$/));
+    await visible(plan.getByText(/^Plan r5\s*·\s*Needs confirmation$/));
+    await visible(
+      plan.locator("[data-plan-dispatch-paused]").filter({
+        hasText:
+          /^Plan dispatch paused\.\s*New plan tasks will wait;\s*employees already running continue\.$/,
+      }),
+    );
     const [first, second] = DESKTOP_TEAM_PLAN_EXPECTED.tasks;
     const firstRow = taskRow(plan, first);
     const secondRow = taskRow(plan, second);
@@ -199,6 +210,7 @@ export async function assertSavedDesktopTeamPlan(
       stableTaskIds: true,
       historicalRevisionCount: 1,
       executionRecordCount: 0,
+      dispatchPausedVisible: true,
     };
   } catch {
     throw new Error("Desktop team-plan saved metadata verification failed.");
@@ -265,6 +277,14 @@ export async function verifyDesktopTeamPlan(page: Page): Promise<DesktopTeamPlan
       .getByRole("textbox", { name: "Task brief and acceptance checks", exact: true })
       .fill(second.prompt);
     await clickMetadataButton(plan, "Save task");
+    step = "pause-new-tasks";
+    await visible(
+      currentTaskText(
+        taskRow(plan, second),
+        /^r2\s*·\s*Priority 5\s*·\s*research\s*·\s*Needs confirmation$/,
+      ),
+    );
+    await clickMetadataButton(plan, "Pause new tasks");
     step = "saved-plan";
     return {
       ...(await assertSavedDesktopTeamPlan(page)),

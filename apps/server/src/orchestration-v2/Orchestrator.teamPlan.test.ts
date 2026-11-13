@@ -664,6 +664,8 @@ it.effect(
       const bound = yield* boundTaskA("linked-run-review");
       const original = bound.child.runs[0]!;
       const task = bound.parent.subagents[0]!;
+      const originalReport = "Original accepted A/r1 artifact evidence.";
+      const laterReport = "UNRELATED LATER RUN CONTENT MUST NOT REACH DEPENDENT";
       const unrelatedRun = {
         ...original,
         id: RunId.make("run:unrelated-later-child-run"),
@@ -682,12 +684,47 @@ it.effect(
             occurredAt: now,
             payload: unrelatedRun,
           },
+          ...[
+            { id: "original", run: original, text: originalReport },
+            { id: "later", run: unrelatedRun, text: laterReport },
+          ].map(({ id, run, text }) => ({
+            id: EventId.make(`event:dependency-report:${id}`),
+            type: "message.updated" as const,
+            threadId: bound.execution.threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: {
+              id: MessageId.make(`message:dependency-report:${id}`),
+              threadId: bound.execution.threadId,
+              runId: run.id,
+              nodeId: run.rootNodeId,
+              role: "assistant" as const,
+              text,
+              attachments: [],
+              streaming: false,
+              createdBy: "agent" as const,
+              creationSource: "provider" as const,
+              createdAt: now,
+              updatedAt: now,
+            },
+          })),
           {
             id: EventId.make("event:synthetic-subagent-completed"),
             type: "subagent.updated",
             threadId: bound.coordinator.parentThreadId,
             occurredAt: now,
-            payload: { ...task, status: "completed" },
+            payload: { ...task, status: "completed", result: laterReport },
+          },
+          {
+            id: EventId.make("event:later-child-workspace"),
+            type: "thread.metadata-updated",
+            threadId: bound.execution.threadId,
+            occurredAt: now,
+            payload: {
+              ...bound.child.thread,
+              worktreePath: "/synthetic/unrelated-later-worktree",
+              branch: "unrelated-later-branch",
+            },
           },
         ],
       });
@@ -757,12 +794,64 @@ it.effect(
       );
       assert.deepEqual(yield* executionSnapshot(), beforeReview);
       yield* orchestrator.dispatch(
+        patch(bound.coordinator.parentThreadId, "propose-new-A-scope", reviewed!.version, [
+          {
+            type: "edit_task",
+            taskId: "A",
+            changes: { prompt: "Proposed A/r2 must not replace accepted A/r1 inputs." },
+          },
+        ]),
+      );
+      yield* orchestrator.dispatch(
         requestPlanTask(bound.coordinator, "dependency-ready", { taskId: "B", revision: 1 }),
       );
       const afterDependency = yield* projections.getTeamPlan(bound.coordinator.parentThreadId);
       const dependent = afterDependency?.tasks.find((candidate) => candidate.taskId === "B");
       assert.equal(dependent?.executions.length, 1);
       assert.notEqual(dependent?.executions[0]?.threadId, bound.execution.threadId);
+      const dependentTask = (yield* orchestrator.getThreadProjection(
+        bound.coordinator.parentThreadId,
+      )).subagents.find((candidate) => candidate.id === dependent?.executions[0]?.subagentId)!;
+      assert.include(
+        dependentTask.prompt,
+        "Act as the research sub-agent for this task.\n\nRead only synthetic fixture B",
+      );
+      assert.notInclude(dependentTask.prompt, laterReport);
+      assert.notInclude(dependentTask.prompt, "Proposed A/r2");
+      assert.notInclude(dependentTask.prompt, "/synthetic/unrelated-later-worktree");
+      assert.notInclude(dependentTask.prompt, "unrelated-later-branch");
+      const handoff = JSON.parse(
+        dependentTask.prompt.split("\n```json\n")[1]!.split("\n```")[0]!,
+      ) as {
+        dependencies: Array<{
+          taskId: string;
+          revision: number;
+          executions: Array<{
+            threadId: string;
+            runId: string;
+            result: string;
+            checkpoint: unknown;
+          }>;
+        }>;
+      };
+      assert.equal(handoff.dependencies[0]?.taskId, "A");
+      assert.equal(handoff.dependencies[0]?.revision, 1);
+      assert.deepEqual(
+        handoff.dependencies[0]?.executions.map(({ threadId, runId, result, checkpoint }) => ({
+          threadId,
+          runId,
+          result,
+          checkpoint,
+        })),
+        [
+          {
+            threadId: bound.execution.threadId,
+            runId: original.id,
+            result: originalReport,
+            checkpoint: null,
+          },
+        ],
+      );
       assert.equal(
         (yield* projections.getThreadRecords(bound.coordinator.parentThreadId, ["subagents"]))
           .subagents.length,

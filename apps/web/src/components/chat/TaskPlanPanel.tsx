@@ -173,8 +173,30 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
             <p className="text-xs font-medium">
               Plan r{plan.revision} · {confirmed ? "Confirmed" : "Needs confirmation"}
             </p>
+            {plan.dispatchPaused === true ? (
+              <p data-plan-dispatch-paused className="text-2xs text-muted-foreground">
+                Plan dispatch paused. New plan tasks will wait; employees already running continue.
+              </p>
+            ) : null}
             <PlanTime label="Plan created" value={plan.createdAt} />
             <div className="flex flex-wrap gap-2">
+              {plan.dispatchPaused !== true ? (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  disabled={!editable || editor !== null}
+                  onClick={() =>
+                    void run("Pausing new tasks", () =>
+                      patch({
+                        expectedPlanVersion: version,
+                        operations: [{ type: "set_dispatch_paused", paused: true }],
+                      }),
+                    )
+                  }
+                >
+                  Pause new tasks
+                </Button>
+              ) : null}
               <Button
                 variant="outline"
                 size="xs"
@@ -249,13 +271,14 @@ export function TaskPlanPanel(props: TaskPlanPanelProps) {
             </div>
             {props.onPrepare ? (
               <p className="text-2xs text-muted-foreground">
-                Refine team asks for proposed plan changes. Review and confirm new revisions before
-                continuing.
+                Refine team pauses new plan tasks and asks for proposed changes. Review and confirm
+                new revisions before continuing.
               </p>
             ) : null}
             {confirmed ? (
               <p className="text-2xs text-muted-foreground">
-                Continue team asks the coordinator to advance this confirmed plan.
+                Continue team resumes new plan tasks and asks the coordinator to advance this
+                confirmed plan.
               </p>
             ) : null}
           </>

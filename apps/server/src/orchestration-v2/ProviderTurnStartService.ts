@@ -63,6 +63,7 @@ import {
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { teamPlanSelectionPolicy } from "./TeamPlanSelectionPolicy.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -77,6 +78,23 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
   },
 ) {}
 
+class TeamPlanExecutionSelectionError extends Schema.TaggedError<TeamPlanExecutionSelectionError>()(
+  "TeamPlanExecutionSelectionError",
+  {
+    runId: RunId,
+    reason: Schema.Literals([
+      "owner_mismatch",
+      "execution_mismatch",
+      "run_unverified",
+      "selection_mismatch",
+    ]),
+  },
+) {
+  override get message(): string {
+    return "Could not verify this run's team task and model selection. Review its plan execution binding before retrying.";
+  }
+}
+
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
 const isProviderAdapterProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 const isProviderAdapterOpenSessionError = Schema.is(
@@ -87,9 +105,11 @@ const isProviderAdapterOpenSessionError = Schema.is(
  * Claude refuses these before it reads the prompt: replacing a process running background work,
  * launch arguments whose appended system prompt or settings cannot be read, or MCP registration
  * that never answers while the query opens. A query that ends before the turn attaches (such as a
- * rejected resume point) never received the prompt either.
+ * rejected resume point) never received the prompt either. ACP selection refusals also precede prompts.
  */
 const PROMPT_REFUSAL_TAGS = [
+  "AcpModelSelectionError",
+  "AcpConfigurationSelectionError",
   "ClaudeBackgroundWorkBlocksQueryReplacementError",
   "ClaudeAppendSystemPromptFileError",
   "ClaudeAppendSystemPromptMissingValueError",
@@ -627,7 +647,49 @@ export const layer: Layer.Layer<
         });
         return;
       }
-      const resolvedRuntimePolicy = resolvedPolicy.success;
+      const selectionPolicy = yield* Effect.result(
+        Effect.gen(function* () {
+          const parentThreadId = projection.thread.lineage.parentThreadId;
+          if (
+            projection.thread.lineage.relationshipToParent !== "subagent" ||
+            parentThreadId === null
+          ) {
+            return "compatible" as const;
+          }
+          const parent = yield* projectionStore.getThreadRecords(parentThreadId, [
+            "teamPlan",
+            "subagents",
+          ]);
+          const selection = teamPlanSelectionPolicy({
+            thread: projection.thread,
+            run,
+            contextTransfers: projection.contextTransfers,
+            parent,
+          });
+          if (selection.type === "unverified") {
+            return yield* new TeamPlanExecutionSelectionError({ runId, reason: selection.reason });
+          }
+          return selection.type;
+        }),
+      );
+      if (selectionPolicy._tag === "Failure") {
+        if (input.willRetry === true) return yield* selectionPolicy.failure;
+        const error = selectionPolicy.failure;
+        yield* settleStartFailure({
+          signal: "team-plan-selection-verification-failure",
+          title: "Couldn't verify team task selection",
+          error,
+          message:
+            error._tag === "TeamPlanExecutionSelectionError"
+              ? error.message
+              : "Could not read the parent team plan. Retry when its state is available.",
+        });
+        return;
+      }
+      const resolvedRuntimePolicy =
+        selectionPolicy.success === "strict"
+          ? { ...resolvedPolicy.success, selectionPolicy: "strict" as const }
+          : resolvedPolicy.success;
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,

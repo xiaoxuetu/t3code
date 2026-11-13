@@ -80,11 +80,16 @@ function savedPlan(): TeamPlan {
   ]);
   const ready = patch([{ type: "reprioritize", taskId: second.taskId, priority: second.priority }]);
   patch([{ type: "confirm_plan", revision: ready.revision }]);
-  return patch([{ type: "edit_task", taskId: second.taskId, changes: { prompt: second.prompt } }]);
+  patch([{ type: "edit_task", taskId: second.taskId, changes: { prompt: second.prompt } }]);
+  return patch([{ type: "set_dispatch_paused", paused: true }]);
 }
 it("accepts real pure-transition metadata and rejects execution, history, owner or confirmation deviations", () => {
   const plan = savedPlan();
+  expect(plan.dispatchPaused).toBe(true);
+  expect(plan.version).toBe(7);
+  expect(plan.revision).toBe(5);
   expect(isExpectedStoredTeamPlan(plan, threadId)).toBe(true);
+  const { dispatchPaused: _paused, ...withoutPause } = plan;
   const modified = (change: (draft: TeamPlan) => unknown) => {
     const draft = structuredClone(plan);
     return change(draft);
@@ -94,7 +99,10 @@ it("accepts real pure-transition metadata and rejects execution, history, owner 
     "private-diagnostic",
     { ...plan, privateDiagnostic: "must not be accepted" },
     { ...plan, threadId: "foreign-owner" },
-    { ...plan, version: 5 },
+    { ...plan, version: 6 },
+    { ...plan, revision: 6 },
+    { ...plan, dispatchPaused: false },
+    withoutPause,
     { ...plan, confirmedRevision: plan.revision },
     { ...plan, tasks: plan.tasks.toReversed() },
     modified((draft) => ({

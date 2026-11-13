@@ -14,6 +14,11 @@ it("keeps confirmation and execution binding outside agent operations", () => {
   expect(isTeamPlanAgentOperation({ type: "bind_execution", taskId: "T1", revision: 1 })).toBe(
     false,
   );
+  for (const paused of [true, false]) {
+    const dispatchControl = { type: "set_dispatch_paused", paused };
+    expect(isTeamPlanOperation(dispatchControl)).toBe(true);
+    expect(isTeamPlanAgentOperation(dispatchControl)).toBe(false);
+  }
   expect(
     isTeamPlanAgentOperation({
       type: "accept_task",

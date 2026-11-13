@@ -175,6 +175,7 @@ export function isExpectedStoredTeamPlan(value: unknown, threadId: string): bool
       version: plan.version,
       revision: plan.revision,
       confirmedRevision: plan.confirmedRevision,
+      dispatchPaused: plan.dispatchPaused,
       tasks: plan.tasks.map((task) => {
         const { history, ...revision } = task;
         return { ...stripRevisionTimes(revision), history: history.map(stripRevisionTimes) };
@@ -195,9 +196,10 @@ export function isExpectedStoredTeamPlan(value: unknown, threadId: string): bool
     return NodeUtil.isDeepStrictEqual(actual, {
       threadId,
       goal: DESKTOP_TEAM_PLAN_EXPECTED.goal,
-      version: 6,
-      revision: 5,
+      version: DESKTOP_TEAM_PLAN_EXPECTED.planVersion,
+      revision: DESKTOP_TEAM_PLAN_EXPECTED.planRevision,
       confirmedRevision: null,
+      dispatchPaused: DESKTOP_TEAM_PLAN_EXPECTED.dispatchPaused,
       tasks: [
         {
           ...expectedRevision(second),
@@ -364,7 +366,7 @@ function createPrivateFixture(runnerTemp: string, onCreated: () => void) {
           .all(threadId);
         check(
           rows.length === 1 &&
-            rows[0]?.version === 6 &&
+            rows[0]?.version === DESKTOP_TEAM_PLAN_EXPECTED.planVersion &&
             typeof rows[0].payload_json === "string" &&
             rows[0].payload_json.length < 65_536,
           "stored-plan-mismatch",
@@ -401,6 +403,7 @@ export async function runTeamPlanSmoke(args: readonly string[]): Promise<boolean
     firstFixtureWindow: false,
     firstBackendOwned: false,
     metadataUiVerified: false,
+    dispatchPausedUiVerified: false,
     storedPlanVerified: false,
     countsUnchangedAfterEdit: false,
     firstCloseVerified: false,
@@ -408,6 +411,7 @@ export async function runTeamPlanSmoke(args: readonly string[]): Promise<boolean
     restartedBackendOwned: false,
     savedPlanUiVerified: false,
     restartedStoredPlanVerified: false,
+    restartedDispatchPausedVerified: false,
     countsUnchangedAfterRestart: false,
     secondCloseVerified: false,
     ownedTempCleaned: false,
@@ -596,6 +600,7 @@ export async function runTeamPlanSmoke(args: readonly string[]): Promise<boolean
       throw new TeamPlanSmokeError("ui-check-failed");
     }
     checks.metadataUiVerified = true;
+    checks.dispatchPausedUiVerified = true;
     workspace.assertPlan();
     checks.storedPlanVerified = true;
     counts.afterEdit = workspace.readCounts();
@@ -619,6 +624,7 @@ export async function runTeamPlanSmoke(args: readonly string[]): Promise<boolean
     checks.savedPlanUiVerified = true;
     workspace.assertPlan();
     checks.restartedStoredPlanVerified = true;
+    checks.restartedDispatchPausedVerified = true;
     counts.afterRestart = workspace.readCounts();
     check(equalCounts(counts.baseline, counts.afterRestart), "execution-count-changed");
     checks.countsUnchangedAfterRestart = true;

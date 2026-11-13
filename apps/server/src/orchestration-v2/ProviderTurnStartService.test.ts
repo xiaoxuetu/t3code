@@ -1075,6 +1075,127 @@ function makeLocalCommandHarness(input: {
   };
 }
 
+function makePlanLinkedStartHarness() {
+  const harness = makeLocalCommandHarness({
+    text: "Execute the confirmed task",
+    previousTurn: { runStatus: "completed", turnStatus: "completed" },
+  });
+  const child = harness.projection();
+  const run = child.runs.at(-1)!;
+  const parentThreadId = ThreadId.make("team-plan-owner");
+  const subagentId = NodeId.make("team-plan-executor");
+  const now = run.requestedAt;
+  const timestamp = DateTime.formatIso(now);
+  const parent = {
+    ...child,
+    thread: { ...child.thread, id: parentThreadId },
+    teamPlan: {
+      threadId: parentThreadId,
+      version: 1,
+      revision: 1,
+      goal: "Execute the confirmed task",
+      confirmedRevision: 1,
+      tasks: [
+        {
+          taskId: "implementation",
+          revision: 1,
+          confirmedRevision: 1,
+          title: "Implement",
+          prompt: "Execute the confirmed task",
+          role: "implementer",
+          modelSelection: run.modelSelection,
+          dependencies: [],
+          acceptance: { status: "pending" as const, note: "", updatedAt: timestamp },
+          executions: [{ subagentId, threadId: child.thread.id, runId: run.id }],
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          priority: 0,
+          history: [],
+        },
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+    subagents: [
+      {
+        id: subagentId,
+        threadId: parentThreadId,
+        runId: RunId.make("team-plan-owner-run"),
+        parentNodeId: NodeId.make("team-plan-owner-node"),
+        origin: "app_owned" as const,
+        createdBy: "agent" as const,
+        driver: child.providerThreads[0]!.driver,
+        providerInstanceId: run.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: child.thread.id,
+        nativeTaskRef: null,
+        prompt: "Execute the confirmed task",
+        title: "Implement",
+        model: run.modelSelection.model,
+        modelSelection: run.modelSelection,
+        status: "pending" as const,
+        result: null,
+        startedAt: null,
+        completedAt: null,
+        updatedAt: now,
+      },
+    ],
+  } satisfies OrchestrationV2ThreadProjection;
+  harness.setProjection({
+    ...child,
+    thread: {
+      ...child.thread,
+      lineage: { parentThreadId, relationshipToParent: "subagent", rootThreadId: parentThreadId },
+      forkedFrom: { type: "node", nodeId: subagentId },
+    },
+    runs: child.runs.map((candidate) =>
+      candidate.id === run.id ? { ...candidate, delegatedTaskId: subagentId } : candidate,
+    ),
+  });
+  harness.getThreadRecords.mockImplementation((id) =>
+    Effect.succeed(id === parentThreadId ? parent : harness.projection()),
+  );
+  return { ...harness, parentThreadId };
+}
+
+effectIt.effect("requires strict selection for an exact plan-bound app-owned initial run", () =>
+  Effect.gen(function* () {
+    const harness = makePlanLinkedStartHarness();
+    yield* harness.start;
+    expect(harness.open).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimePolicy: expect.objectContaining({ selectionPolicy: "strict" }),
+      }),
+    );
+    expect(harness.startRootRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimePolicy: expect.objectContaining({ selectionPolicy: "strict" }),
+      }),
+    );
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+  }),
+);
+
+effectIt.effect("blocks provider start when the parent plan cannot be read", () =>
+  Effect.gen(function* () {
+    const harness = makePlanLinkedStartHarness();
+    harness.getThreadRecords.mockImplementation((id) =>
+      id === harness.parentThreadId
+        ? Effect.fail(
+            new ProjectionStore.ProjectionStoreReadError({
+              threadId: id,
+              cause: "fixture read failure",
+            }),
+          )
+        : Effect.succeed(harness.projection()),
+    );
+    yield* harness.start;
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+  }),
+);
+
 effectIt.effect(
   "recovers the local or pushed thread tip, else the current branch, remote default, or detached HEAD",
   () =>

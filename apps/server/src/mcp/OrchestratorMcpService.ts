@@ -72,7 +72,7 @@ import { getProviderOptionCurrentValue, withLegacyUltracodeEffort } from "@t3too
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
-import { teamPlanTaskCommandId } from "@t3tools/shared/teamPlan";
+import { teamPlanTaskCommandId, teamPlanTaskRevision } from "@t3tools/shared/teamPlan";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -1443,6 +1443,7 @@ const make = Effect.gen(function* () {
     readonly parent: Pick<OrchestrationV2ThreadProjection, "thread">;
     readonly target: OrchestratorMcpTarget | undefined;
     readonly providers: ReadonlyArray<ServerProvider>;
+    readonly inheritParentOptions?: boolean;
     /** Receipt replays bypass current settings because they start no work. Dispatch must reuse the checked command ID. */
     readonly skipProjectEnablementFilter?: boolean;
   }): Effect.fn.Return<ResolvedTarget, OrchestratorMcpFailure> {
@@ -1551,12 +1552,13 @@ const make = Effect.gen(function* () {
       instanceId === inheritedSelection.instanceId &&
       (advertised?.slug ?? model) ===
         (advertisedModel(provider, inheritedSelection.model)?.slug ?? inheritedSelection.model);
-    let options = inheritsOptions
-      ? knownOptions(
-          withLegacyUltracodeEffort(descriptors, inheritedSelection.options),
-          descriptors,
-        )
-      : undefined;
+    let options =
+      inheritsOptions && input.inheritParentOptions !== false
+        ? knownOptions(
+            withLegacyUltracodeEffort(descriptors, inheritedSelection.options),
+            descriptors,
+          )
+        : undefined;
     if (requestedOptions !== undefined) {
       const selections = new Map(
         (requestedOptions.length === 0 ? [] : (options ?? [])).map((selection) => [
@@ -2612,6 +2614,71 @@ const make = Effect.gen(function* () {
           "Delegated tasks require an active run owned by this MCP provider session.",
         );
       }
+      let dispatchTarget = input.target;
+      if (input.planTaskRef !== undefined) {
+        const saved = yield* loadThreadRecords(scope.thread.threadId, ["teamPlan"]);
+        const plannedTask = saved.teamPlan?.tasks.find(
+          (task) => task.taskId === input.planTaskRef?.taskId,
+        );
+        const revision =
+          plannedTask === undefined
+            ? undefined
+            : teamPlanTaskRevision(plannedTask, input.planTaskRef.revision);
+        if (revision !== undefined && revision.executions.length > 0) {
+          if (revision.executions.length !== 1) {
+            return yield* failure(
+              "invalid_request",
+              "This task revision has multiple execution links. Inspect its saved sessions before continuing.",
+            );
+          }
+          const execution = revision.executions[0]!;
+          const ownedTask = (yield* loadTasks(scope.thread.threadId, [execution.subagentId])).find(
+            (task) =>
+              task.id === execution.subagentId &&
+              task.origin === "app_owned" &&
+              task.threadId === scope.thread.threadId &&
+              task.childThreadId === execution.threadId,
+          );
+          if (ownedTask === undefined) {
+            return yield* failure(
+              "invalid_request",
+              "The saved task execution does not match this coordinator's delegated session.",
+            );
+          }
+          const current = yield* readTask(scope, execution.subagentId);
+          if (
+            current.childThreadId !== execution.threadId ||
+            (execution.runId !== null && current.childRunId !== execution.runId)
+          ) {
+            return yield* failure(
+              "invalid_request",
+              "The saved task execution does not match its original run. Inspect the existing session.",
+            );
+          }
+          // Recover committed work before checking whether its provider can start anything new.
+          return yield* input.mode === "wait"
+            ? awaitTask(
+                scope,
+                execution.subagentId,
+                yield* requestKey(input.clientRequestId),
+                input.timeoutMs,
+              )
+            : readTask(scope, execution.subagentId, false, true);
+        }
+        if (
+          plannedTask !== undefined &&
+          plannedTask.revision === input.planTaskRef.revision &&
+          plannedTask.modelSelection !== null
+        ) {
+          const selection = plannedTask.modelSelection;
+          dispatchTarget = {
+            ...input.target,
+            providerInstanceId: input.target?.providerInstanceId ?? selection.instanceId,
+            model: input.target?.model ?? selection.model,
+            options: input.target?.options ?? selection.options ?? [],
+          };
+        }
+      }
       const providers = yield* loadProviders;
       const key = yield* requestKey(input.clientRequestId);
       const commandId =
@@ -2621,8 +2688,9 @@ const make = Effect.gen(function* () {
       const isRetryOfAcceptedDelegation = yield* threadManagement.hasReceipt(commandId);
       const target = yield* resolveTargetRechecking({
         parent,
-        target: input.target,
+        target: dispatchTarget,
         providers,
+        inheritParentOptions: input.planTaskRef === undefined,
         skipProjectEnablementFilter: isRetryOfAcceptedDelegation,
       });
       const runtimeMode = yield* resolveRuntimeMode(

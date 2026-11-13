@@ -71,6 +71,7 @@ export const TeamPlan = Schema.Struct({
   revision: Revision,
   goal: Schema.String,
   confirmedRevision: Schema.NullOr(Revision),
+  dispatchPaused: Schema.optionalKey(Schema.Boolean),
   tasks: Schema.Array(TeamPlanTask),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
@@ -105,6 +106,10 @@ const ConfirmTask = Schema.Struct({
   type: Schema.Literal("confirm_task"),
   ...TeamPlanTaskRef.fields,
 });
+const SetDispatchPaused = Schema.Struct({
+  type: Schema.Literal("set_dispatch_paused"),
+  paused: Schema.Boolean,
+});
 const BindExecution = Schema.Struct({
   type: Schema.Literal("bind_execution"),
   ...TeamPlanTaskRef.fields,
@@ -137,6 +142,7 @@ export const TeamPlanOperation = Schema.Union([
   ConfirmPlan,
   ConfirmTask,
   BindExecution,
+  SetDispatchPaused,
   AcceptTask,
 ]);
 export type TeamPlanOperation = typeof TeamPlanOperation.Type;

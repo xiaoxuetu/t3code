@@ -70,6 +70,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
+import { applyTeamPlanPatch } from "@t3tools/shared/teamPlan";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
 import type { ProjectionRecordFilter } from "../orchestration-v2/ProjectionStore.ts";
@@ -3473,9 +3474,55 @@ describe("OrchestratorMcpService provider resolution", () => {
               ],
             },
           },
+          {
+            name: "confirmed plan clears unrelated parent options",
+            target: {},
+            planSelection: { instanceId: codexInstanceId, model: inherited.model },
+            expected: { instanceId: codexInstanceId, model: inherited.model, options: [] },
+          },
+          {
+            name: "confirmed plan retains only its approved option subset",
+            target: {},
+            planSelection: { ...inherited, options: override },
+            expected: { ...inherited, options: override },
+          },
+          {
+            name: "confirmed plan selects its own provider without a duplicate target",
+            target: {},
+            planSelection: { instanceId: peerId, model: inherited.model },
+            expected: { instanceId: peerId, model: inherited.model, options: [] },
+          },
         ] as const;
         for (const testCase of cases) {
           const commands: Array<unknown> = [];
+          const decision =
+            "planSelection" in testCase
+              ? applyTeamPlanPatch(
+                  null,
+                  {
+                    expectedPlanVersion: 0,
+                    operations: [
+                      { type: "set_goal", goal: "Review the approved selection." },
+                      {
+                        type: "add_task",
+                        task: {
+                          taskId: "T1",
+                          title: "Review",
+                          prompt: "Review the change.",
+                          role: "review",
+                          priority: 1,
+                          dependencies: [],
+                          modelSelection: testCase.planSelection,
+                        },
+                      },
+                      { type: "confirm_plan", revision: 3 },
+                    ],
+                  },
+                  { threadId: parentThreadId, now: "2026-11-13T00:00:00.000Z" },
+                )
+              : null;
+          if (decision !== null && !decision.ok) return yield* Effect.die("Invalid plan fixture.");
+          const teamPlan = decision?.ok ? decision.plan : null;
           const task = {
             id: taskId,
             threadId: parentThreadId,
@@ -3495,10 +3542,13 @@ describe("OrchestratorMcpService provider resolution", () => {
               getThreadRecords: (threadId) =>
                 Effect.succeed(
                   threadId === parentThreadId
-                    ? parentProjection(
-                        commands.length > 0 ? [task] : [],
-                        "parent" in testCase ? testCase.parent : inherited,
-                      )
+                    ? {
+                        ...parentProjection(
+                          commands.length > 0 ? [task] : [],
+                          "parent" in testCase ? testCase.parent : inherited,
+                        ),
+                        teamPlan,
+                      }
                     : childProjection,
                 ),
               dispatch: (command) =>
@@ -3562,6 +3612,7 @@ describe("OrchestratorMcpService provider resolution", () => {
             yield* service.delegateTask(scope, {
               task: "Review the change.",
               target: yield* decodeTarget(testCase.target),
+              ...(teamPlan === null ? {} : { planTaskRef: { taskId: "T1", revision: 1 } }),
               mode: "async",
               clientRequestId: testCase.name,
             });

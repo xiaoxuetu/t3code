@@ -3,6 +3,7 @@ import type {
   TeamPlan,
   TeamPlanDependency,
   TeamPlanOperation,
+  TeamPlanPatch,
   TeamPlanTask,
 } from "@t3tools/contracts";
 
@@ -12,6 +13,50 @@ export interface TaskPlanDraft {
   readonly role: string;
   readonly priority: string;
   readonly dependencies: ReadonlyArray<TeamPlanDependency>;
+}
+
+export function taskPlanCoordinatorPatch(
+  plan: TeamPlan | null,
+  request: { readonly phase: "prepare"; readonly goal: string } | { readonly phase: "continue" },
+):
+  | { readonly ok: true; readonly goal: string; readonly patch: TeamPlanPatch | null }
+  | { readonly ok: false; readonly message: string } {
+  if (request.phase === "prepare") {
+    const goal = request.goal.trim();
+    if (!goal) return { ok: false, message: "Enter the team's goal." };
+    const operations: TeamPlanOperation[] = [];
+    if (plan?.goal !== goal) operations.push({ type: "set_goal", goal });
+    if (plan?.dispatchPaused !== true)
+      operations.push({ type: "set_dispatch_paused", paused: true });
+    return {
+      ok: true,
+      goal,
+      patch:
+        operations.length === 0 ? null : { expectedPlanVersion: plan?.version ?? 0, operations },
+    };
+  }
+  if (
+    plan === null ||
+    !plan.goal.trim() ||
+    plan.tasks.length === 0 ||
+    plan.confirmedRevision !== plan.revision
+  ) {
+    return {
+      ok: false,
+      message: "Review and confirm the current task plan before continuing the team.",
+    };
+  }
+  return {
+    ok: true,
+    goal: plan.goal,
+    patch:
+      plan.dispatchPaused === true
+        ? {
+            expectedPlanVersion: plan.version,
+            operations: [{ type: "set_dispatch_paused", paused: false }],
+          }
+        : null,
+  };
 }
 
 export function nextTaskPlanKey(plan: TeamPlan | null): string {
