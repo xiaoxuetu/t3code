@@ -1,0 +1,119 @@
+name: Publish verified Workbench macOS preview 4
+on:
+  push:
+    branches: [release/workbench-preview-4]
+    paths: [.github/workflows/publish-workbench-preview-4.yml]
+permissions: {}
+concurrency:
+  group: publish-workbench-preview-4
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'xiaoxuetu/t3code' && github.ref == 'refs/heads/release/workbench-preview-4'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: xiaoxuetu/t3code
+      SOURCE_SHA: 7f1e5d9e63d4b9fa63c77f98234636dcafc80f44
+      SOURCE_RUN: '43410646779'
+      ARTIFACT_ID: '14029368357'
+      ARTIFACT_SHA256: 318689636cbcb9530aeed95c9c2ee96731fa4da77df9773a280dd2fafccabf4e
+      RELEASE_TAG: v0.1.0-workbench.4
+    steps:
+      - name: Check exact successful source run and artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN" > run.json
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID" > artifact.json
+          python3 - <<'PY'
+          import json, os
+          r=json.load(open('run.json')); a=json.load(open('artifact.json'))
+          assert r['status']=='completed' and r['conclusion']=='success'
+          assert r['head_sha']==os.environ['SOURCE_SHA']
+          assert r['repository']['full_name']==os.environ['GH_REPO']
+          assert r['head_repository']['full_name']==os.environ['GH_REPO']
+          assert a['workflow_run']['id']==int(os.environ['SOURCE_RUN'])
+          assert a['workflow_run']['head_sha']==os.environ['SOURCE_SHA']
+          assert a['name']=='t3-pstack-workbench-macos-arm64' and not a['expired']
+          assert a['digest']=='sha256:'+os.environ['ARTIFACT_SHA256']
+          PY
+      - name: Download and verify artifact without executing its contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > artifact.zip
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, zipfile
+          def digest(p):
+            h=hashlib.sha256()
+            with open(p,'rb') as f:
+              for b in iter(lambda:f.read(1024*1024), b''): h.update(b)
+            return h.hexdigest()
+          assert digest('artifact.zip')==os.environ['ARTIFACT_SHA256']
+          out=pathlib.Path('release'); out.mkdir()
+          with zipfile.ZipFile('artifact.zip') as z:
+            selected=[i for i in z.infolist() if i.filename.startswith('release-workbench-macos/') and not i.is_dir() and (i.filename.endswith(('.dmg','.zip')) or pathlib.PurePosixPath(i.filename).name in ('SHA256SUMS','VALIDATION.json'))]
+            assert len(selected)==4, [i.filename for i in selected]
+            names=[pathlib.PurePosixPath(i.filename).name for i in selected]
+            assert len(set(names))==4
+            for i, name in zip(selected,names):
+              assert re.fullmatch(r'[A-Za-z0-9_. -]+',name) and not name.startswith('.')
+              (out/name).write_bytes(z.read(i))
+          v=json.load(open(out/'VALIDATION.json'))
+          assert v['sourceCommit']==os.environ['SOURCE_SHA'] and v['platform']=='darwin' and v['arch']=='arm64'
+          assert v['packagedStartup']=='passed' and v['fixtureThread']=='passed'
+          lines=(out/'SHA256SUMS').read_text().splitlines(); assert len(lines)==2
+          expected=set()
+          for line in lines:
+            sha,name=line.split('  ',1)
+            assert pathlib.Path(name).name==name and name.endswith(('.dmg','.zip'))
+            assert digest(out/name)==sha
+            expected.add(name)
+          assert expected=={p.name for p in out.iterdir() if p.suffix in ('.dmg','.zip')}
+          assert len(expected)==2 and sum(n.endswith('.dmg') for n in expected)==1
+          PY
+      - name: Write accurate prerelease notes
+        shell: bash
+        run: |
+          cat > NOTES.md <<'EOF'
+          ## T3 + pstack Workbench 工程预览 0.1.0-workbench.4
+          适用于 Apple Silicon Mac（arm64）。这是供下载验证的工程预览，不是完整产品验收或稳定版。
+
+          ### 已验证
+          - Mac 原生构建、相关应用类型检查及聚焦回归测试通过。
+          - DMG 挂载、安装副本完整性、应用启动与 fixture 会话检查通过。
+          - 包内包含 pstack 工作流资料；团队任务面板复用委派记录。
+
+          ### 未验证及限制
+          - Codex、Antigravity、Qoder 真实执行和完整自动组队、验收、定时汇报流程尚未端到端验证。
+          - 下载后的 Gatekeeper 行为尚未验证。仅 ad-hoc 签名，没有 Developer ID 信任或 Apple 公证，首次打开可能被系统阻止；请勿关闭系统安全机制。
+          - 动态项目任务清单、优先级调度和完整时间统计不属于本次已验证范围。
+          - Windows、Linux、Intel Mac 和移动端不在本包验证范围。
+
+          源码：7f1e5d9e63d4b9fa63c77f98234636dcafc80f44
+          构建及验证：https://github.com/xiaoxuetu/t3code/actions/runs/43410646779
+          附件含 DMG、ZIP、SHA256SUMS 与 VALIDATION.json。SHA256 已在发布前重新核验。
+          EOF
+      - name: Create draft, upload exact verified files, then publish prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to replace assets automatically.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --target "$SOURCE_SHA" --draft --prerelease --latest=false --title 'T3 Pstack Workbench 0.1.0-workbench.4 · macOS arm64 preview' --notes-file NOTES.md
+          gh release upload "$RELEASE_TAG" release/*
+          gh release view "$RELEASE_TAG" --json assets > uploaded.json
+          python3 - <<'PY'
+          import json, pathlib
+          a=json.load(open('uploaded.json'))['assets']
+          expected={p.name:p.stat().st_size for p in pathlib.Path('release').iterdir()}
+          assert len(a)==4 and {x['name']:x['size'] for x in a}==expected
+          PY
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
