@@ -22,6 +22,7 @@ import {
   SIMPLE_FIXTURE_MESSAGE,
   verifyFixtureWindow,
   renameFixtureThread,
+  isDesktopFixtureRenameError,
 } from "./lib/desktop-fixture-ui.ts";
 
 import {
@@ -65,7 +66,12 @@ async function main() {
   });
   const output = NodePath.resolve(values["artifacts-dir"]!);
   const versions = { official: "0.1.9", workbench: DEFAULT_WORKBENCH_VERSION };
-  const checks: Record<string, boolean | number> = {};
+  const checks: Record<string, boolean | number> = {
+    officialWarmupRenameBegan: false,
+    officialWarmupRenameCompleted: false,
+    officialWarmupTitlePersisted: false,
+    officialWarmupAppClosed: false,
+  };
   let phase = "host-guard";
   let status = "failed";
   let failureCode: string | null = null;
@@ -228,9 +234,13 @@ async function main() {
       SIMPLE_FIXTURE_TITLE,
       titles.workbench,
     );
+    checks.officialWarmupRenameBegan = true;
     await renameFixtureThread(warm.page, SIMPLE_FIXTURE_TITLE, titles.official);
+    checks.officialWarmupRenameCompleted = true;
     await persistedTitle("official", titles.official);
+    checks.officialWarmupTitlePersisted = true;
     await closeTracked(warm.tracked);
+    checks.officialWarmupAppClosed = true;
     const beforeFork = workspace.snapshotOfficial();
     checks.officialWarmupClosedBeforeSnapshot = true;
 
@@ -323,7 +333,8 @@ async function main() {
     failureCode =
       error instanceof IsolationCheckError ||
       error instanceof MacIsolationWorkspaceError ||
-      error instanceof MacIsolationProcessError
+      error instanceof MacIsolationProcessError ||
+      isDesktopFixtureRenameError(error)
         ? error.code
         : "check-did-not-pass";
     if (error instanceof MacIsolationProcessError) commandFailure = error.commandFailure ?? null;

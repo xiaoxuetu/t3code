@@ -1,4 +1,4 @@
-name: Validate released Mac default paths and coexistence
+name: Validate pinned .8 Mac default paths and coexistence
 
 on:
   push:
@@ -11,13 +11,14 @@ on:
   workflow_dispatch:
     inputs:
       allow_dependency_execution:
-        description: Allow the pinned released applications to run with synthetic data on a fresh disposable Mac
+        description: Allow the pinned .8 build and official app to run with synthetic data on a fresh disposable Mac
         type: boolean
         required: true
         default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: workbench-macos-isolation-${{ github.ref }}
@@ -34,7 +35,19 @@ jobs:
     timeout-minutes: 30
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+      VP_REMOTE_CACHE: "off"
+      VP_REMOTE_CACHE_URL: "http://127.0.0.1:9"
     steps:
+      - name: Initialize private dependency configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_root="$RUNNER_TEMP/workbench-isolation-dependencies-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$config_root"
+          touch "$config_root/npm-user.npmrc" "$config_root/npm-global.npmrc"
+          printf 'NPM_CONFIG_USERCONFIG=%s/npm-user.npmrc\n' "$config_root" >> "$GITHUB_ENV"
+          printf 'NPM_CONFIG_GLOBALCONFIG=%s/npm-global.npmrc\n' "$config_root" >> "$GITHUB_ENV"
+          printf 'NPM_CONFIG_CACHE=%s/npm-cache\n' "$config_root" >> "$GITHUB_ENV"
       - name: Checkout public test source without persisted credentials
         shell: bash
         env:
@@ -49,6 +62,15 @@ jobs:
           git -c credential.helper= fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git checkout --detach FETCH_HEAD
+      - name: Download the fixed GUI-validated .8 build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: "14044265573"
+          run-id: "43436232622"
+          repository: xiaoxuetu/t3code
+          github-token: ${{ github.token }}
+          path: workbench-build-input
+          digest-mismatch: error
       - name: Setup locked host test dependencies
         uses: ./.github/actions/setup-ci-deps
         with:
@@ -60,8 +82,8 @@ jobs:
       - name: Verify synthetic guards and observation helpers
         working-directory: scripts
         shell: bash
-        run: vp test run --config ../vite.config.ts --dir . lib/mac-isolation-workspace.test.ts lib/mac-isolation-process.test.ts lib/desktop-fixture-ui.test.ts
-      - name: Verify pinned release downloads before any app execution
+        run: vp test run --config ../vite.config.ts --dir . lib/mac-isolation-workspace.test.ts lib/mac-isolation-process.test.ts lib/desktop-fixture-ui.test.ts lib/mac-workbench-build-input.test.ts
+      - name: Verify fixed build provenance and both DMGs before any app execution
         shell: bash
         run: |
           set -euo pipefail
@@ -70,25 +92,37 @@ jobs:
           printf 'WORKBENCH_ISOLATION_ROOT=%s\n' "$isolation_root" >> "$GITHUB_ENV"
           mkdir -p macos-isolation-validation
           curl --fail --location --retry 2 --output "$isolation_root/official.dmg" https://github.com/pingdotgg/t3code/releases/download/v0.1.9/T3-Code-0.1.9-arm64.dmg
-          curl --fail --location --retry 2 --output "$isolation_root/workbench.dmg" https://github.com/xiaoxuetu/t3code/releases/download/v0.1.0-workbench.4/T3-Pstack-Workbench-0.1.0-workbench.4-arm64.dmg
           export WORKBENCH_ISOLATION_INPUT="$isolation_root"
           node --input-type=module <<'JS'
           import fs from "node:fs";
           import path from "node:path";
           import { createHash } from "node:crypto";
-          const expected = {official: "b0a15cb7aac2461425f670b14ac52d7a207a0e2008250882c850b4cd62aa926a", workbench: "2504acdd645f192c3982722768d927c2998d94c07df345c412e9a34ebe95b59c"};
-          const verified = {};
-          for (const [kind, sha256] of Object.entries(expected)) {
+          import { resolveBuiltWorkbenchDmg } from "./scripts/lib/mac-workbench-build-input.ts";
+          const workbenchVersion = "0.1.0-workbench.8";
+          const binarySourceCommit = "1b43fdff87de83b8f4fdd2c242009a7d6e073087";
+          const testSourceCommit = process.env.GITHUB_SHA;
+          if (!/^[0-9a-f]{40}$/.test(testSourceCommit ?? "")) throw new Error("Invalid test source commit");
+          const input = "workbench-build-input/release-workbench-macos";
+          const manifest = JSON.parse(fs.readFileSync(path.join(input, "VALIDATION.json"), "utf8"));
+          if (manifest.sourceCommit !== binarySourceCommit || manifest.platform !== "darwin" || manifest.arch !== "arm64" || manifest.packagedStartup !== "passed" || manifest.fixtureThread !== "passed" || manifest.teamPlanMetadata !== "passed" || manifest.teamWorkflow !== "not verified with real provider") throw new Error("Pinned build validation manifest mismatch");
+          const realProviders = {codex: "not verified", antigravity: "not verified", qoder: "not verified"};
+          if (manifest.realProviders === null || typeof manifest.realProviders !== "object" || Object.keys(manifest.realProviders).sort().join(",") !== "antigravity,codex,qoder" || Object.entries(realProviders).some(([provider, expected]) => manifest.realProviders[provider] !== expected)) throw new Error("Pinned provider validation scope mismatch");
+          const built = resolveBuiltWorkbenchDmg({version: workbenchVersion, filenames: fs.readdirSync(input), checksumText: fs.readFileSync(path.join(input, "SHA256SUMS"), "utf8")});
+          const expected = {official: "b0a15cb7aac2461425f670b14ac52d7a207a0e2008250882c850b4cd62aa926a", workbench: "a371f6518bf38ea7450d5ba2e7846c56a09201cbde1357e5cbd8bbafdef93860"};
+          if (built === null || built.sha256 !== expected.workbench) throw new Error("Pinned Workbench checksum manifest mismatch");
+          const hash = async (filename) => {
             const h = createHash("sha256");
-            for await (const chunk of fs.createReadStream(path.join(process.env.WORKBENCH_ISOLATION_INPUT, `${kind}.dmg`))) h.update(chunk);
-            if (h.digest("hex") !== sha256) throw new Error(`Pinned ${kind} asset digest mismatch`);
-            verified[kind] = {sha256, matched: true};
-          }
-          const fixture = createHash("sha256");
-          for await (const chunk of fs.createReadStream("scripts/fixtures/desktop-launch/statev2.sqlite")) fixture.update(chunk);
-          const fixtureSha256 = fixture.digest("hex");
+            for await (const chunk of fs.createReadStream(filename)) h.update(chunk);
+            return h.digest("hex");
+          };
+          if (await hash(path.join(process.env.WORKBENCH_ISOLATION_INPUT, "official.dmg")) !== expected.official) throw new Error("Pinned official asset digest mismatch");
+          const builtDmg = path.join(input, built.fileName);
+          if (await hash(builtDmg) !== expected.workbench) throw new Error("Pinned Workbench asset digest mismatch");
+          fs.copyFileSync(builtDmg, path.join(process.env.WORKBENCH_ISOLATION_INPUT, "workbench.dmg"));
+          const verified = {official: {sha256: expected.official, matched: true}, workbench: {sha256: expected.workbench, matched: true}};
+          const fixtureSha256 = await hash("scripts/fixtures/desktop-launch/statev2.sqlite");
           if (fixtureSha256 !== "e65f15f89a847a264cf4366cd7bcdc31cef1d5fbfd07707ed497cc0f045357b5") throw new Error("Pinned synthetic fixture digest mismatch");
-          fs.writeFileSync("macos-isolation-validation/SOURCE-DIGESTS.json", JSON.stringify({officialVersion: "0.1.9", workbenchVersion: "0.1.0-workbench.4", fixtureSha256, verified}, null, 2)+"\n");
+          fs.writeFileSync("macos-isolation-validation/SOURCE-DIGESTS.json", JSON.stringify({officialVersion: "0.1.9", workbenchVersion, binarySourceCommit, testSourceCommit, buildRunId: 43436232622, artifactId: 14044265573, fixtureSha256, verified, realProviders, teamWorkflow: "not verified with real provider"}, null, 2)+"\n");
           JS
       - name: Run real default-path and concurrent-app checks
         shell: bash
@@ -134,12 +168,12 @@ jobs:
           fs.writeFileSync("macos-isolation-validation/SIGNATURES.json", JSON.stringify({strictIntegrity: verified}, null, 2)+"\n");
           if (!verified.official || !verified.workbench) process.exitCode = 1;
           JS
-          node scripts/verify-macos-workbench-isolation.ts --official-executable "$official_installed/Contents/MacOS/$official_executable" --workbench-executable "$workbench_installed/Contents/MacOS/$workbench_executable" --artifacts-dir macos-isolation-validation
+          node scripts/verify-macos-workbench-isolation.ts --official-executable "$official_installed/Contents/MacOS/$official_executable" --workbench-executable "$workbench_installed/Contents/MacOS/$workbench_executable" --workbench-version 0.1.0-workbench.8 --artifacts-dir macos-isolation-validation
       - name: Upload fixed isolation evidence only
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: workbench-macos-default-paths-and-coexistence
+          name: workbench-macos-pinned-8-default-paths-and-coexistence
           path: |
             macos-isolation-validation/RESULT.json
             macos-isolation-validation/SOURCE-DIGESTS.json

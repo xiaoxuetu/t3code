@@ -2,16 +2,18 @@ import type { ElectronApplication, Page } from "playwright-core";
 import { expect, it, vi } from "vite-plus/test";
 import {
   renameFixtureThread,
+  DesktopFixtureRenameError,
+  isDesktopFixtureRenameError,
   SIMPLE_FIXTURE_MESSAGE,
   SIMPLE_FIXTURE_TITLE,
   verifyFixtureWindow,
 } from "./desktop-fixture-ui.ts";
 
-function fixture(failure?: string, unexpectedCount = 0) {
+function fixture(failure?: string, unexpectedCount = 0, failureMessage?: string) {
   const calls: string[] = [];
   const step = (name: string) => {
     calls.push(name);
-    if (name === failure) throw new Error(`Synthetic ${name} failure`);
+    if (name === failure) throw new Error(failureMessage ?? `Synthetic ${name} failure`);
   };
   const waitFor = (name: string) => vi.fn(async (_options: unknown) => step(name));
   const row = {
@@ -166,13 +168,35 @@ it("renames through F2 and the page-level input, then requires both new labels a
   expect(mocks.oldThread.waitFor).toHaveBeenLastCalledWith({ state: "detached", timeout: 60_000 });
 });
 
-it.each(["F2", "commit-title", "new-title-visible", "new-header-visible", "old-title-gone"])(
-  "does not accept a rename that fails at %s",
-  async (failure) => {
-    const { page, calls } = fixture(failure);
-    await expect(
-      renameFixtureThread(page, SIMPLE_FIXTURE_TITLE, "Workbench unique fixture"),
-    ).rejects.toThrow(`Synthetic ${failure} failure`);
-    expect(calls.at(-1)).toBe(failure);
-  },
-);
+it.each([
+  ["old-title-visible", "fixture-rename-old-title-visible"],
+  ["focus", "fixture-rename-focus-row"],
+  ["F2", "fixture-rename-press-f2"],
+  ["fill-title", "fixture-rename-fill-title"],
+  ["commit-title", "fixture-rename-submit-title"],
+  ["new-title-visible", "fixture-rename-new-title-visible"],
+  ["new-header-visible", "fixture-rename-new-actions-visible"],
+  ["old-title-gone", "fixture-rename-old-title-detached"],
+] as const)("reports only a fixed rename step when %s fails", async (failure, code) => {
+  const privateTitle = "synthetic private title /private/example <div>private DOM</div>";
+  const privateError = `Original Playwright detail: ${privateTitle}`;
+  const { page, calls } = fixture(failure, 0, privateError);
+  const error: unknown = await renameFixtureThread(page, SIMPLE_FIXTURE_TITLE, privateTitle).catch(
+    (cause) => cause,
+  );
+  expect(error).toBeInstanceOf(DesktopFixtureRenameError);
+  expect(error).toMatchObject({ code });
+  expect(isDesktopFixtureRenameError(error)).toBe(true);
+  expect(isDesktopFixtureRenameError({ code, message: privateError })).toBe(false);
+  expect(
+    isDesktopFixtureRenameError(
+      Object.assign(new DesktopFixtureRenameError(code), { code: privateError }),
+    ),
+  ).toBe(false);
+  expect(String(error)).toBe("DesktopFixtureRenameError: Desktop fixture rename did not pass.");
+  expect(JSON.parse(JSON.stringify(error))).toEqual({ name: "DesktopFixtureRenameError", code });
+  expect(String(error)).not.toContain(privateTitle);
+  expect(JSON.stringify(error)).not.toContain(privateError);
+  expect(error).not.toHaveProperty("cause");
+  expect(calls.at(-1)).toBe(failure);
+});
